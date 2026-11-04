@@ -49,7 +49,7 @@ A task is done only when `make check` passes. Fast loop (L0–L1 + short simulat
 - Inject `Clock`, random source, FS, transport and `Catalogue`. No `time.Now()`, `time.Sleep`, global `math/rand` or direct `os` file calls outside `disk/` and `cmd/`.
 - `format/` and `names/` are pure: no I/O, no globals.
 - Decoders must never panic on arbitrary bytes; return errors.
-- No CGO (no RocksDB). Standard library first (including `crypto/aes`, `crypto/cipher`, `crypto/hkdf`). `.nidx` is our own immutable hash table, built in memory, written once and read with positioned reads through the FS interface (no mmap, no Pebble). Other new dependencies need human approval.
+- No CGO (no RocksDB). Standard library first (including `crypto/aes`, `crypto/cipher`, `crypto/hkdf`). `.nidx` is our own immutable hash table, built in memory, written once and read with positioned reads through the FS interface (no mmap, no Pebble). Approved dependencies: `pgx` (PostgreSQL), `testcontainers-go` (L2 tests), `modernc.org/sqlite` (pure Go; SQLite catalogue for tests/dev, never production). Other new dependencies need human approval.
 - Bounded resources: request buffering under a byte-sized memory budget (`503` when full); index file handles in a bounded LRU, opened on demand and closed on idle timeout.
 - SQL is plain, readable SQL — no ORM. Migrations: transactional statements only, `text` + `CHECK` instead of enums, no `CREATE INDEX CONCURRENTLY`.
 - The node is embeddable (`docs/design-notes.md` §15): `Start`/`Stop` restartable in-process; no package-level state, `os.Exit` or `log.Fatal` outside `cmd/`; alarms and metrics go through the injected `Alarms` / `Metrics` interfaces, never carrying names, metadata or keys.
@@ -61,15 +61,14 @@ A task is done only when `make check` passes. Fast loop (L0–L1 + short simulat
 format/     pure encode/decode of on-disk structures
 names/      pure bucket/name validation, shard function
 disk/       FS interface: real, in-memory, fault-injecting
-catalogue/  Catalogue interface: PostgreSQL impl + in-memory fake
+catalogue/  Catalogue interface: PostgreSQL impl (production), SQLite impl (tests/dev only), in-memory fake
 volume/     single-writer append, group commit, seal, erase, .idx
 nameindex/  open-volume name map, .nidx build (in memory, write once) / read (positioned reads), file-handle LRU
 transport/  node-to-node RPC (forwarding, replica I/O): HTTP impl + in-memory
-node/       API handlers, routing, shard leases and handover, lookup, reconcile/GC
+node/       public embedding API (Start/Stop/Alarms/Metrics, §15); API handlers, routing, shard leases and handover, lookup, reconcile/GC
 scan/ admin/ db/   tools
 sim/        deterministic multi-node simulator
-<embed pkg>/ public Start/Stop/Alarms/Metrics API (name TBD, §15)
-cmd/store/  flags, signals, calls the embed API — wiring only
+cmd/store/  flags, signals, calls node.Start — wiring only
 ```
 
 ## Testing layers — put tests in the right one

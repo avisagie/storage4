@@ -616,7 +616,9 @@ func (n *Node) Stop(ctx context.Context) error // drain, seal open volumes, rele
 - Stop joins all goroutines (leak test). A clean Stop and a crash recover identically: a restarted owner seals, never resumes.
 - Alarm details and metric labels never carry names, metadata or keys.
 
-**Open:** package name for the embedding API; whether the node owns the HTTP listener, the host mounts `Handler()`, or both (node-to-node transport likely needs its own listener).
+**Decided:** the embedding API lives in package `node`. The catalogue also has a SQLite implementation (tests/dev only, behind the same interface and contract suite; PostgreSQL stays the only production catalogue).
+
+**Open:** whether the node owns the HTTP listener, the host mounts `Handler()`, or both (node-to-node transport likely needs its own listener).
 
 ## Open threads
 
