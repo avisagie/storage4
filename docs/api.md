@@ -1,6 +1,6 @@
 # HTTP API v1
 
-**Status: DRAFT for review.** Once approved and a client integrates this is permanent. Rationale: `design-notes.md` §6, §10, §11. Sections marked **[REVIEW]** are choices the design notes left open.
+**Status: APPROVED 2026-11-04 (decisions in §5 confirmed). Permanent once a client integrates.** Rationale: `design-notes.md` §6, §10, §11. Sections marked **[REVIEW]** are choices the design notes left open.
 
 Plain HTTP/1.1 (stdlib), served by any node; a node forwards to the shard owner internally. Internal locators (volume ID, seq, check, disk, node) are **never** exposed in any response, header or error body.
 
@@ -99,7 +99,7 @@ Error responses have a short plain-text body (`text/plain`, one line, no names, 
 - **Authentication:** a shared token inside the air gap, sent as `Authorization: Bearer <token>`; missing or wrong → `401`. TLS later. **[REVIEW]**
 - **Query strings** on `/b/` and `/m/` requests are rejected with `400`.
 
-## 5. Decisions to confirm [REVIEW]
+## 5. Decisions (confirmed 2026-11-04)
 
 1. Percent-escapes outside the name alphabet → `400`.
 2. `If-None-Match: *` together with `If-Match` → `400`.
