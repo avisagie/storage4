@@ -16,3 +16,9 @@ test:
 
 build:
 	CGO_ENABLED=0 go build -o bin/store ./cmd/store
+
+.PHONY: pg-start pg-stop
+pg-start:
+	scripts/pg-start.sh
+pg-stop:
+	scripts/pg-stop.sh
