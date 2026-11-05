@@ -70,6 +70,7 @@ node/       public embedding API (Start/Stop/Alarms/Metrics, §15); API handlers
 scan/ admin/ db/   tools
 sim/        deterministic multi-node simulator
 cmd/store/  flags, signals, calls node.Start — wiring only
+cmd/storeload/  load generator (write/read) against running nodes
 ```
 
 ## Testing layers — put tests in the right one
