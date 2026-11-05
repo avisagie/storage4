@@ -378,7 +378,7 @@ func (c *Catalogue) lockLease(ctx context.Context, tx *sql.Tx, l catalogue.Lease
 
 // ---- volumes ----
 
-const volumeCols = "volume_id, bucket, shard, ordinal, state, epoch, format_major, format_minor, cipher_id, tier, committed_length, record_count, created_ms, sealed_ms"
+const volumeCols = "volume_id, bucket, shard, volume_number, state, epoch, format_major, format_minor, cipher_id, tier, committed_length, record_count, created_ms, sealed_ms"
 
 func scanVolume(r scanner) (catalogue.Volume, error) {
 	var v catalogue.Volume
@@ -386,7 +386,7 @@ func scanVolume(r scanner) (catalogue.Volume, error) {
 	var epoch, fmaj, fmin, cipher, tier int
 	var committed, records, sealed sql.NullInt64
 	var created int64
-	if err := r.Scan(&id, &v.Bucket, &v.Shard, &v.Ordinal, &state, &epoch, &fmaj, &fmin, &cipher, &tier,
+	if err := r.Scan(&id, &v.Bucket, &v.Shard, &v.VolumeNumber, &state, &epoch, &fmaj, &fmin, &cipher, &tier,
 		&committed, &records, &created, &sealed); err != nil {
 		return v, err
 	}
@@ -439,11 +439,11 @@ func (c *Catalogue) withReplicas(ctx context.Context, tx *sql.Tx, vols []catalog
 func (c *Catalogue) OpenVolume(ctx context.Context, l catalogue.Lease, p catalogue.OpenParams) (catalogue.Volume, error) {
 	var v catalogue.Volume
 	err := c.tx(ctx, false, func(tx *sql.Tx) error {
-		// The lease check and the ordinal are one statement; a refusal later rolls the ordinal back.
-		var ordinal int64
-		err := c.row(ctx, tx, `UPDATE shards SET next_ordinal = next_ordinal + 1
+		// The lease check and the volume number are one statement; a refusal later rolls it back.
+		var volumeNumber int64
+		err := c.row(ctx, tx, `UPDATE shards SET next_volume_number = next_volume_number + 1
 			WHERE bucket = ? AND shard = ? AND lease_node = ? AND lease_generation = ? AND lease_expires_ms > ?
-			RETURNING next_ordinal - 1`, l.Bucket, l.Shard, int(l.Node), l.Generation, c.now()).Scan(&ordinal)
+			RETURNING next_volume_number - 1`, l.Bucket, l.Shard, int(l.Node), l.Generation, c.now()).Scan(&volumeNumber)
 		if errors.Is(err, sql.ErrNoRows) {
 			return catalogue.ErrLeaseLost
 		}
@@ -485,12 +485,12 @@ func (c *Catalogue) OpenVolume(ctx context.Context, l catalogue.Lease, p catalog
 			}
 		}
 		now := c.now()
-		if _, err := c.exec(ctx, tx, `INSERT INTO volumes (volume_id, bucket, shard, ordinal, state, epoch, format_major, format_minor, cipher_id, tier, created_ms)
-			VALUES (?, ?, ?, ?, 'open', 1, ?, ?, ?, ?, ?)`, p.ID.String(), l.Bucket, l.Shard, ordinal,
+		if _, err := c.exec(ctx, tx, `INSERT INTO volumes (volume_id, bucket, shard, volume_number, state, epoch, format_major, format_minor, cipher_id, tier, created_ms)
+			VALUES (?, ?, ?, ?, 'open', 1, ?, ?, ?, ?, ?)`, p.ID.String(), l.Bucket, l.Shard, volumeNumber,
 			int(p.FormatMajor), int(p.FormatMinor), int(p.CipherID), int(p.Tier), now); err != nil {
 			return err
 		}
-		v = catalogue.Volume{ID: p.ID, Bucket: l.Bucket, Shard: l.Shard, Ordinal: ordinal, State: catalogue.VolumeOpen, Epoch: 1,
+		v = catalogue.Volume{ID: p.ID, Bucket: l.Bucket, Shard: l.Shard, VolumeNumber: volumeNumber, State: catalogue.VolumeOpen, Epoch: 1,
 			FormatMajor: p.FormatMajor, FormatMinor: p.FormatMinor, CipherID: p.CipherID, Tier: p.Tier, CreatedAt: tm(now)}
 		for _, d := range p.Disks {
 			if _, err := c.exec(ctx, tx, "INSERT INTO volume_replicas (volume_id, disk_id, state) VALUES (?, ?, 'ok')", p.ID.String(), d.String()); err != nil {
@@ -613,7 +613,7 @@ func (c *Catalogue) listVolumes(ctx context.Context, q, rq string, args ...any) 
 
 func (c *Catalogue) ListShardVolumes(ctx context.Context, bucket string, shard int) ([]catalogue.Volume, error) {
 	return c.listVolumes(ctx,
-		"SELECT "+volumeCols+" FROM volumes WHERE bucket = ? AND shard = ? ORDER BY ordinal DESC",
+		"SELECT "+volumeCols+" FROM volumes WHERE bucket = ? AND shard = ? ORDER BY volume_number DESC",
 		"SELECT r.volume_id, r.disk_id, r.state FROM volume_replicas r JOIN volumes v ON v.volume_id = r.volume_id WHERE v.bucket = ? AND v.shard = ? ORDER BY r.volume_id, r.disk_id",
 		bucket, shard)
 }

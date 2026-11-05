@@ -40,7 +40,7 @@ Request headers (all optional):
 - Both conditions present → `400`. **[REVIEW]**
 
 Behaviour:
-- Compared **only with the latest version**: if the new file's SHA-256 equals the latest version's, nothing is stored and the response is `200`; otherwise a new version is stored and the response is `201`. Content flipping A → B → A stores A again. Metadata differences alone do not create a version. **[REVIEW]**
+- Compared **only with the latest version**: if the new file's SHA-256 **and** its metadata bytes both equal the latest version's (absent and empty metadata are the same), nothing is stored and the response is `200`; otherwise a new version is stored and the response is `201`. Identical content with different metadata therefore stores a new version (the file must be sent again; there is no metadata-only update). Content or metadata flipping A → B → A stores A again.
 - Conditions are evaluated against the latest version before the dedup comparison.
 - The response is sent only after the version is durable on **all** replicas.
 - Success responses carry `ETag: "<hex sha-256>"` and `Repr-Digest: sha-256=:<base64>:`, with an empty body.
@@ -103,7 +103,7 @@ Error responses have a short plain-text body (`text/plain`, one line, no names, 
 
 1. Percent-escapes outside the name alphabet → `400`.
 2. `If-None-Match: *` together with `If-Match` → `400`.
-3. Metadata-only changes do not create a new version; dedup looks at file bytes only.
+3. (Changed 2026-11-05.) Dedup compares file SHA-256 and metadata bytes; a metadata change with identical content creates a new version. The ETag stays the file's SHA-256, so it does not change with metadata.
 4. Conditions are checked before dedup.
 5. No `Range` support in v1.
 6. Bucket `shards` option range 1..1024; implicit bucket creation on first write.

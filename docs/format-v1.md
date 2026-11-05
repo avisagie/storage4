@@ -50,7 +50,7 @@ Starts at offset 16. Fixed part (64 bytes):
 | 24 | 16 | cluster_id | opaque 16 bytes (UUID) |
 | 40 | 4 | shard | `0 ≤ shard < shard_count` |
 | 44 | 4 | shard_count (S) | fixed per bucket |
-| 48 | 8 | ordinal | per-(bucket, shard) volume ordinal from the catalogue |
+| 48 | 8 | volume_number | the volume's position among the (bucket, shard)'s volumes, assigned by the catalogue (1, 2, …); versions order by (volume_number, seq) |
 | 56 | 8 | created_unix_nano | i64, informational only; never used for ordering |
 | 64 | 4 | epoch | epoch at creation (see seal record for the final epoch) |
 | 68 | 4 | key_generation | 0 when unencrypted |
@@ -89,7 +89,7 @@ A record has a fixed header, two regions A and B, and two CRCs:
 - Total record length = `roundup8(32 + A + B)`. **A record's length never changes after it is written.**
 - `sha256` is the SHA-256 of the plaintext payload (the content identity; the HTTP ETag). It is always present in region A; for types other than `file` it is 32 zero bytes.
 - `name` is the file name bytes, case-sensitive, no terminator. `metadata` is opaque and never parsed.
-- `seq` values are **strictly increasing in file order**, but may have gaps (a failed append consumes its seq). A seq is **never reused** within a volume. The volume's latest-version order for a name is (ordinal, seq).
+- `seq` values are **strictly increasing in file order**, but may have gaps (a failed append consumes its seq). A seq is **never reused** within a volume. The volume's latest-version order for a name is (volume number, seq).
 - `check` has no meaning beyond being stored; it lets a reader detect a locator that points at the wrong record.
 
 ### 5.1 Types
@@ -184,7 +184,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffff5334523101000500
 6406b7a1df000000
 ```
 
-**`header.bin`** (96 bytes): volume header: bucket `events`, volume ID 0x0001000000000001, shard 3 of 16, ordinal 7, epoch 1
+**`header.bin`** (96 bytes): volume header: bucket `events`, volume ID 0x0001000000000001, shard 3 of 16, volume number 7, epoch 1
 ```
 895334564f4c0d0a01000000500000000100000000000100a0a1a2a3a4a5a6a7
 a8a9aaabacadaeaf0300000010000000070000000000000000006d85d5310218
@@ -265,7 +265,7 @@ f24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b98247d
 ## 11. Decisions (confirmed 2026-11-04)
 
 1. Little-endian for all stored integers.
-2. Field widths: `ordinal` u64, `seq` u32 starting at 1, `name_len` u16, `meta_len`/`payload_len` u32, `check` u32, `tier` u16, `key_generation` u32.
+2. Field widths: `volume_number` u64, `seq` u32 starting at 1, `name_len` u16, `meta_len`/`payload_len` u32, `check` u32, `tier` u16, `key_generation` u32.
 3. Fixed record header is 24 bytes; `header_CRC` covers it plus region A; records are padded to 8 bytes.
 4. Region A always carries a 32-byte sha256 (zero for non-file types).
 5. Seal is an ordinary record with its own seq, and the file must end right after it.

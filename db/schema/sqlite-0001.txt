@@ -46,7 +46,7 @@ shards|bucket|text|NO
 shards|lease_expires_ms|bigint|YES
 shards|lease_generation|bigint|NO
 shards|lease_node|int|YES
-shards|next_ordinal|bigint|NO
+shards|next_volume_number|bigint|NO
 shards|shard|int|NO
 volume_replicas|disk_id|text|NO
 volume_replicas|state|text|NO
@@ -58,10 +58,10 @@ volumes|created_ms|bigint|NO
 volumes|epoch|int|NO
 volumes|format_major|int|NO
 volumes|format_minor|int|NO
-volumes|ordinal|bigint|NO
 volumes|record_count|bigint|YES
 volumes|sealed_ms|bigint|YES
 volumes|shard|int|NO
 volumes|state|text|NO
 volumes|tier|int|NO
 volumes|volume_id|text|NO
+volumes|volume_number|bigint|NO

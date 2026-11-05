@@ -21,10 +21,10 @@ type shardKey struct {
 }
 
 type shardRow struct {
-	nextOrdinal  int64
-	leaseNode    catalogue.NodeID // 0 = none
-	generation   int64
-	leaseExpires int64 // Unix ms
+	nextVolumeNumber int64
+	leaseNode        catalogue.NodeID // 0 = none
+	generation       int64
+	leaseExpires     int64 // Unix ms
 }
 
 type volRow struct {
@@ -224,7 +224,7 @@ func (c *Catalogue) AcquireShard(ctx context.Context, bucket string, shard int, 
 	k := shardKey{bucket, shard}
 	s := c.shards[k]
 	if s == nil {
-		s = &shardRow{nextOrdinal: 1}
+		s = &shardRow{nextVolumeNumber: 1}
 		c.shards[k] = s
 	}
 	now := c.nowMs()
@@ -336,10 +336,10 @@ func (c *Catalogue) OpenVolume(ctx context.Context, l catalogue.Lease, p catalog
 		}
 	}
 	r := &volRow{created: c.nowMs(), replicas: map[catalogue.DiskID]catalogue.ReplicaState{}}
-	r.v = catalogue.Volume{ID: p.ID, Bucket: l.Bucket, Shard: l.Shard, Ordinal: s.nextOrdinal,
+	r.v = catalogue.Volume{ID: p.ID, Bucket: l.Bucket, Shard: l.Shard, VolumeNumber: s.nextVolumeNumber,
 		State: catalogue.VolumeOpen, Epoch: 1, FormatMajor: p.FormatMajor, FormatMinor: p.FormatMinor,
 		CipherID: p.CipherID, Tier: p.Tier}
-	s.nextOrdinal++
+	s.nextVolumeNumber++
 	for _, d := range p.Disks {
 		r.replicas[d] = catalogue.ReplicaOK
 	}
@@ -432,7 +432,7 @@ func (c *Catalogue) ListShardVolumes(ctx context.Context, bucket string, shard i
 			out = append(out, c.snapshot(r))
 		}
 	}
-	slices.SortFunc(out, func(a, b catalogue.Volume) int { return cmp.Compare(b.Ordinal, a.Ordinal) })
+	slices.SortFunc(out, func(a, b catalogue.Volume) int { return cmp.Compare(b.VolumeNumber, a.VolumeNumber) })
 	return out, nil
 }
 

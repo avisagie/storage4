@@ -34,7 +34,7 @@ func payload(name string, ver int) []byte { return []byte(fmt.Sprintf("payload o
 // returns the locators and the open map the owner would have kept.
 func mkVolume(t *testing.T, fsys disk.FS, volumeId uint64, names ...string) ([]volume.Locator, *OpenMap) {
 	t.Helper()
-	w, err := volume.Create(fsys, format.VolumeHeader{VolumeID: volumeId, ShardCount: 4, Shard: 1, Ordinal: 3,
+	w, err := volume.Create(fsys, format.VolumeHeader{VolumeID: volumeId, ShardCount: 4, Shard: 1, VolumeNumber: 3,
 		Epoch: 1, Bucket: bkt}, volume.Options{Rand: rnd()})
 	if err != nil {
 		t.Fatal(err)
@@ -327,7 +327,7 @@ func TestEnsure(t *testing.T) {
 
 func TestRebuildRefusesOpenVolume(t *testing.T) {
 	fsys := disk.NewMem(disk.MemOptions{})
-	w, err := volume.Create(fsys, format.VolumeHeader{VolumeID: vid, ShardCount: 4, Shard: 1, Ordinal: 3,
+	w, err := volume.Create(fsys, format.VolumeHeader{VolumeID: vid, ShardCount: 4, Shard: 1, VolumeNumber: 3,
 		Epoch: 1, Bucket: bkt}, volume.Options{Rand: rnd()})
 	if err != nil {
 		t.Fatal(err)

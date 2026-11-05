@@ -19,7 +19,7 @@ func counter() func() uint32 {
 }
 
 func hdr() format.VolumeHeader {
-	return format.VolumeHeader{VolumeID: 0x0001_0000_0000_0007, ShardCount: 4, Shard: 1, Ordinal: 3,
+	return format.VolumeHeader{VolumeID: 0x0001_0000_0000_0007, ShardCount: 4, Shard: 1, VolumeNumber: 3,
 		Epoch: 1, Bucket: "events"}
 }
 

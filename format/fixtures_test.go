@@ -19,7 +19,7 @@ func fixtureHeader() VolumeHeader {
 		ClusterID:       cluster,
 		Shard:           3,
 		ShardCount:      16,
-		Ordinal:         7,
+		VolumeNumber:    7,
 		CreatedUnixNano: 1730000000000000000,
 		Epoch:           1,
 		Bucket:          "events",

@@ -14,17 +14,17 @@ A task is done only when `make check` passes. Fast loop (L0–L1 + short simulat
 
 ## Permanent things — do not change without explicit human approval
 
-- **On-disk format** (prelude, volume header incl. bucket/shard/S/ordinal/cipher ID/key generation, record framing incl. the two regions name‖sha256‖metadata / payload with their tag fields, seal record). Any change = new format version; old versions stay readable forever.
+- **On-disk format** (prelude, volume header incl. bucket/shard/S/volume number/cipher ID/key generation, record framing incl. the two regions name‖sha256‖metadata / payload with their tag fields, seal record). Any change = new format version; old versions stay readable forever.
 - **HTTP API contract**: `PUT|GET|HEAD|DELETE /b/{bucket}/{name...}`, `GET /m/{bucket}/{name...}`, `PUT|DELETE /b/{bucket}`; `ETag` = SHA-256, `Repr-Digest`, `Content-Digest` (400 on mismatch), `If-None-Match: *` / `If-Match` (412); `201` stored vs `200` identical-to-latest. Internal locators are never exposed.
 - **Name rules**: bucket 1–128 chars of `[A-Za-z0-9._-]`, not starting with `.`/`-`, not `.`/`..`. File name 1–512 bytes, `/`-separated segments of `[A-Za-z0-9._:-]`, no empty/`.`/`..` segments, no leading/trailing `/`. Byte-exact, case-sensitive.
 - **Shard function**: `shard = first 8 bytes of SHA-256(name) as big-endian u64 mod S`; S fixed per bucket and recorded in every volume header.
-- **ID spaces**: volume ID = `node_id(16) | node-local counter(48)`; node IDs never reused; per-(bucket, shard) volume ordinals assigned by the catalogue.
+- **ID spaces**: volume ID = `node_id(16) | node-local counter(48)`; node IDs never reused; per-(bucket, shard) volume numbers assigned by the catalogue.
 - **Released migrations** in `db/migrations/` and **golden files** in `format/testdata/`. CI rejects edits. Add a new migration / new golden file instead.
 
 ## Invariants — never break, never weaken a test that checks them
 
 - Only the node holding the catalogue's shard lease for (bucket, shard) opens or appends to that shard's volumes. On handover, the previous owner's open volumes are sealed (epoch bump) before the new owner writes.
-- Latest version of a name = highest (ordinal, seq). Never order versions by clocks.
+- Latest version of a name = highest (volume number, seq). Never order versions by clocks.
 - Dedup compares only with the latest version: identical sha256 → `200`, store nothing; otherwise append a new version.
 - A seq is never reused within a volume, even after a failed append (required for AES-GCM nonces: nonce = volume ID ‖ seq).
 - Ack only after **all** replicas fsync. Never ack on quorum.
@@ -41,7 +41,7 @@ A task is done only when `make check` passes. Fast loop (L0–L1 + short simulat
 - No business concepts in storage code (event time, retention rules, event IDs, ES keys).
 - No per-file rows in PostgreSQL — only buckets, shard leases, volumes, erasure list.
 - Nodes never run DDL and never auto-initialise the catalogue; refuse to start on an empty DB or cluster-ID mismatch.
-- Volume IDs and ordinals never come from anything that can go back in time.
+- Volume IDs and volume numbers never come from anything that can go back in time.
 - Encryption (cipher 0 = none is the MVP default): keys are never written to node disks and never logged; a bucket key is committed to the catalogue before first use; destroying a bucket key is irreversible and needs explicit operator confirmation.
 
 ## Code rules
@@ -78,7 +78,7 @@ cmd/store/  flags, signals, calls node.Start — wiring only
 |---|---|---|
 | L0 pure | format, names, shard function, CRC, nonce construction, `.nidx` table encode/decode | table tests, round-trip, `go test -fuzz`, golden files |
 | L1 component | volume writer, erasure, `.idx`, `.nidx`, restart recovery | in-memory / fault-injecting FS (short write, fsync error, ENOSPC, torn write, crash-at-any-write); corrupted/wrong-version index files; fingerprint collisions |
-| L2 catalogue | SQL, shard/volume leases, ordinals, epochs, migrations | PostgreSQL, either local (`STORAGE4_TEST_PG_DSN`) or testcontainers-go — both are first class and run the same suite; migrations empty→latest, snapshot→latest, run twice |
+| L2 catalogue | SQL, shard/volume leases, volume numbers, epochs, migrations | PostgreSQL, either local (`STORAGE4_TEST_PG_DSN`) or testcontainers-go — both are first class and run the same suite; migrations empty→latest, snapshot→latest, run twice |
 | Contract | fake vs real catalogue | one suite run against both; extend it whenever the `Catalogue` interface changes |
 | L3 simulation | anything involving more than one node (forwarding, handover, replication) | `sim/`: seeded scheduler, virtual clock, fault events, invariant checks every step |
 | L4 e2e | real binaries, nightly | Docker Compose, `kill -9`, disk full, PG failover, shard handover, `scan rebuild` |

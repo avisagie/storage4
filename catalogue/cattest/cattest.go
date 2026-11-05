@@ -285,7 +285,7 @@ func testVolumes(t *testing.T, f Factory) {
 	e.bucket("b", 2)
 	l := e.lease("b", 0, 1)
 	v1 := e.open(l, 1, disk(11), disk(21))
-	if v1.Ordinal != 1 || v1.State != catalogue.VolumeOpen || v1.Epoch != 1 || v1.Bucket != "b" || v1.Shard != 0 ||
+	if v1.VolumeNumber != 1 || v1.State != catalogue.VolumeOpen || v1.Epoch != 1 || v1.Bucket != "b" || v1.Shard != 0 ||
 		v1.FormatMajor != 1 || !v1.CreatedAt.Equal(e.clk.Now()) || !v1.SealedAt.IsZero() ||
 		len(v1.Replicas) != 2 || v1.Replicas[0].Disk != disk(11) || v1.Replicas[1].Disk != disk(21) ||
 		v1.Replicas[0].State != catalogue.ReplicaOK {
@@ -298,17 +298,17 @@ func testVolumes(t *testing.T, f Factory) {
 	}
 	_, err = e.c.GetVolume(e.ctx, vol(1, 99))
 	e.is(err, catalogue.ErrVolumeNotFound)
-	// Ordinals continue across releases and re-acquisition; they never go back.
+	// VolumeNumbers continue across releases and re-acquisition; they never go back.
 	e.must(e.c.ReleaseShard(e.ctx, l))
 	l = e.lease("b", 0, 2)
 	v2 := e.open(l, 2, disk(12), disk(22))
 	v3 := e.open(l, 3, disk(12), disk(22))
-	if v2.Ordinal != 2 || v3.Ordinal != 3 {
-		t.Fatalf("ordinals %d %d", v2.Ordinal, v3.Ordinal)
+	if v2.VolumeNumber != 2 || v3.VolumeNumber != 3 {
+		t.Fatalf("volume numbers %d %d", v2.VolumeNumber, v3.VolumeNumber)
 	}
 	// Another shard counts on its own.
 	l1 := e.lease("b", 1, 1)
-	if v := e.open(l1, 4, disk(11)); v.Ordinal != 1 {
+	if v := e.open(l1, 4, disk(11)); v.VolumeNumber != 1 {
 		t.Fatalf("%+v", v)
 	}
 	list, err := e.c.ListShardVolumes(e.ctx, "b", 0)
@@ -324,7 +324,7 @@ func testVolumes(t *testing.T, f Factory) {
 	if list, _ = e.c.ListShardVolumes(e.ctx, "b", 1); len(list) != 1 {
 		t.Fatalf("%+v", list)
 	}
-	// Refusals leave no trace and consume no ordinal.
+	// Refusals leave no trace and consume no volume_number.
 	open := func(p catalogue.OpenParams) error { _, err := e.c.OpenVolume(e.ctx, l, p); return err }
 	e.is(open(catalogue.OpenParams{ID: v2.ID, Disks: []catalogue.DiskID{disk(12)}}), catalogue.ErrVolumeExists)
 	e.is(open(catalogue.OpenParams{ID: vol(1, 50), Disks: []catalogue.DiskID{disk(12)}}), catalogue.ErrInvalidArgument) // other node's ID
@@ -335,8 +335,8 @@ func testVolumes(t *testing.T, f Factory) {
 	e.is(open(catalogue.OpenParams{ID: vol(2, 50), Disks: []catalogue.DiskID{disk(12)}, CipherID: 1}), catalogue.ErrInvalidArgument)
 	e.must(e.c.SetDiskState(e.ctx, disk(22), catalogue.DiskReadOnly))
 	e.is(open(catalogue.OpenParams{ID: vol(2, 50), Disks: []catalogue.DiskID{disk(22)}}), catalogue.ErrDiskUnavailable)
-	if v := e.open(l, 5, disk(12)); v.Ordinal != 4 {
-		t.Fatalf("a refusal consumed an ordinal: %+v", v)
+	if v := e.open(l, 5, disk(12)); v.VolumeNumber != 4 {
+		t.Fatalf("a refusal consumed an volume_number: %+v", v)
 	}
 }
 
@@ -409,7 +409,7 @@ func testFencing(t *testing.T, f Factory) {
 	e.must(err)
 	e.must(e.c.FinishSeal(e.ctx, nl, vs[0].ID, ep, 4096, 5))
 	nv := e.open(nl, 3, disk(12))
-	if nv.Ordinal != 2 {
+	if nv.VolumeNumber != 2 {
 		t.Fatalf("%+v", nv)
 	}
 }
@@ -672,7 +672,7 @@ func testConcurrentLeases(t *testing.T, f Factory) {
 	}
 }
 
-// Concurrent opens under one lease get distinct, dense ordinals.
+// Concurrent opens under one lease get distinct, dense volume numbers.
 func testConcurrentOpen(t *testing.T, f Factory) {
 	e := newEnv(t, f)
 	e.cluster(1)
@@ -690,7 +690,7 @@ func testConcurrentOpen(t *testing.T, f Factory) {
 				t.Error(err)
 				return
 			}
-			ords[i] = v.Ordinal
+			ords[i] = v.VolumeNumber
 		}()
 	}
 	wg.Wait()
@@ -700,7 +700,7 @@ func testConcurrentOpen(t *testing.T, f Factory) {
 	}
 	for o := int64(1); o <= n; o++ {
 		if !seen[o] {
-			t.Fatalf("ordinals not dense: %v", ords)
+			t.Fatalf("volume numbers not dense: %v", ords)
 		}
 	}
 }

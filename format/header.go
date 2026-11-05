@@ -20,7 +20,7 @@ type VolumeHeader struct {
 	ClusterID       [16]byte
 	Shard           uint32
 	ShardCount      uint32
-	Ordinal         uint64
+	VolumeNumber    uint64
 	CreatedUnixNano int64 // informational only
 	Epoch           uint32
 	KeyGeneration   uint32
@@ -56,7 +56,7 @@ func AppendVolumeHeader(dst []byte, h VolumeHeader) ([]byte, error) {
 	dst = append(dst, h.ClusterID[:]...)
 	dst = le.AppendUint32(dst, h.Shard)
 	dst = le.AppendUint32(dst, h.ShardCount)
-	dst = le.AppendUint64(dst, h.Ordinal)
+	dst = le.AppendUint64(dst, h.VolumeNumber)
 	dst = le.AppendUint64(dst, uint64(h.CreatedUnixNano))
 	dst = le.AppendUint32(dst, h.Epoch)
 	dst = le.AppendUint32(dst, h.KeyGeneration)
@@ -94,7 +94,7 @@ func DecodeVolumeHeader(b []byte) (VolumeHeader, int, error) {
 	copy(h.ClusterID[:], b[24:40])
 	h.Shard = le.Uint32(b[40:])
 	h.ShardCount = le.Uint32(b[44:])
-	h.Ordinal = le.Uint64(b[48:])
+	h.VolumeNumber = le.Uint64(b[48:])
 	h.CreatedUnixNano = int64(le.Uint64(b[56:]))
 	h.Epoch = le.Uint32(b[64:])
 	h.KeyGeneration = le.Uint32(b[68:])

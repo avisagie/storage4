@@ -39,7 +39,7 @@ At the large end, **metadata (file count), failure handling and migration time a
 - **Single-file erasure is best effort: zero in place**, offsets unchanged, no space reclaimed (§11).
 - **Encryption at rest is required but staged**: the v1 format carries a cipher ID and a two-region record layout (name ‖ sha256 ‖ metadata / payload, each with a tag field that is empty when unencrypted). The MVP ships the **null cipher (0)**, so a rescued disk is readable without key tooling, and platform-level disk encryption (LUKS, another team) can land on its own schedule. A later cipher (AES-256-GCM, shorthand "v2" below) adds record encryption for **bucket-granular crypto-shredding** with **no framing change**: one key per bucket in the catalogue, per-volume sub-keys derived (§7, §11).
 - **One Go binary, PostgreSQL as the only source of truth, no separate catalogue server** (§8). PostgreSQL holds buckets, shard leases and volumes — never per-file rows.
-- **Catalogue uses synchronous replication** — leases, epochs, ordinals, bucket state and (later) keys must never go back in time (§8). **PostgreSQL down → writes fail** (reads continue from caches).
+- **Catalogue uses synchronous replication** — leases, epochs, volume numbers, bucket state and (later) keys must never go back in time (§8). **PostgreSQL down → writes fail** (reads continue from caches).
 - **Catalogue schema managed by explicit `store db` commands** — idempotent, transactional, expand/contract; nodes never run DDL or auto-initialise (§13).
 - **Write throughput is not the constraint**; node count is driven by capacity and failure domains (§9).
 - **Balance comes only from placement at volume open** — data is never moved. **No space reservation** (§9).
@@ -114,7 +114,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 **Structure:**
 - Bucket → **S shards** (`shard = first 8 bytes of SHA-256(name) as big-endian u64 mod S`) → per (bucket, shard) a sequence of **volumes** (append-only pack files, a few GB, ≤ 32 GiB) → N replicas on distinct disks/servers. Replicas are byte-identical, except for erasures in progress (§11).
 - **S** is chosen when the bucket is created (explicit option or deployment default) and fixed for the bucket's life; recorded in the catalogue and in every volume header. Small or rarely written buckets use small S (fewer, fuller volumes); the busiest buckets use roughly the node count.
-- The **catalogue** maps volume → (bucket, shard, ordinal, replica locations); nodes cache and refresh on "not here".
+- The **catalogue** maps volume → (bucket, shard, volume number, replica locations); nodes cache and refresh on "not here".
 
 **Shard ownership:**
 - Each (bucket, shard) has at most one **owner**, holding a **shard lease** in the catalogue. Only the lease holder opens volumes in that shard and appends to them; **a node starts writing a shard only after the catalogue has granted it the lease.**
@@ -122,7 +122,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 - **Handover** (node failure, node added/removed): the previous lease is released (graceful: old owner seals its open volumes and builds their index files) or expires. The new owner acquires the lease, seals any of the shard's volumes still open (epoch bump fences the old owner), rebuilds missing index files by a full pass over those volumes (§7, *Restart and index recovery*), then serves. While this runs, the shard answers `503` + `Retry-After` — seconds to a minute, growing with open-volume size.
 - Shard leases exist only for (bucket, shard) pairs that are being written; idle ones are released.
 
-**Per-shard volume ordinal:** the catalogue assigns each new volume of a (bucket, shard) the next ordinal, in the same transaction that opens it under the shard lease; the volume header records it. **Latest version of a name = highest (ordinal, seq)** — a strict order from the single writer per shard, no clocks involved. Synchronous catalogue replication means ordinals never go back.
+**Per-shard volume number:** the catalogue assigns each new volume of a (bucket, shard) the next volume number, in the same transaction that opens it under the shard lease; the volume header records it. **Latest version of a name = highest (volume number, seq)** — a strict order from the single writer per shard, no clocks involved. Synchronous catalogue replication means volume numbers never go back.
 
 **Internal record locator** (never exposed): `volume ID | seq | check`. Used in index entries, the erasure list and logs.
 - **Volume ID (64 bit) = `node_id (16) | node-local counter (48)`**: each node has a node ID (assigned once by admin command, never reused) and a counter persisted on the node (allocated in blocks, fsync'd before use). A node that loses its counter state gets a **new node ID**. Startup refuses if another live node reports the same node ID. No PostgreSQL sequences, so no rewind after failover.
@@ -141,7 +141,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 3. Owner opens a new volume for the (bucket, shard) on healthy disks and retries — client sees latency only.
 4. Surviving replicas truncated to committed length.
 5. Sealed volume is now under-replicated → failure policy below.
-- Owner also dead: the next owner (after handover) seals at the **minimum** surviving replica length (acked ⇒ on all replicas). Unacked-but-written records become orphans; the index file includes them, but no client was told they exist — harmless, since a later write of the same name gets a higher (ordinal, seq). Caveat: if the unacked record is a new version of an existing name and the client never retries, it becomes the latest version — a `503` after a mid-write failure is an indeterminate outcome (document in `docs/api.md`).
+- Owner also dead: the next owner (after handover) seals at the **minimum** surviving replica length (acked ⇒ on all replicas). Unacked-but-written records become orphans; the index file includes them, but no client was told they exist — harmless, since a later write of the same name gets a higher (volume number, seq). Caveat: if the unacked record is a new version of an existing name and the client never retries, it becomes the latest version — a `503` after a mid-write failure is an indeterminate outcome (document in `docs/api.md`).
 - Never ack on quorum; seal-on-failure keeps consensus confined to the catalogue.
 
 **Failure policy — separate "down" from "gone":**
@@ -157,7 +157,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 - Manual delay = time at reduced redundancy. Needs an operator SLA and escalating alerts.
 - Re-replication copies bytes verbatim (ciphertext for v2) — never re-encrypts.
 
-**Tier migration of an open bucket:** seal open volumes → new writes to target tier → copy / EC-encode sealed volumes (with their index files) → update catalogue → delete old copies. Names and ordinals unchanged.
+**Tier migration of an open bucket:** seal open volumes → new writes to target tier → copy / EC-encode sealed volumes (with their index files) → update catalogue → delete old copies. Names and volume numbers unchanged.
 
 **Edge cases:**
 - Returning disk after "gone" committed: wipe and rejoin. Before commit: reconcile against catalogue (epoch, committed length, checksums, pending erasures).
@@ -176,7 +176,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 - **v1** = MVP. The volume header carries a **cipher ID** (0 = none, the MVP). Encrypted volumes (shorthand **"v2"** in these notes = cipher ID ≠ 0) use the **same framing** — the record layout below already has the tag fields, empty for cipher 0 — so enabling encryption needs no framing change; readers refuse unknown cipher IDs. Readers support every version and cipher that may still exist on disk — potentially 15–20 years with extended retention — so keep each spec small.
 
 **On-disk format (v1):**
-- **Volume header:** volume ID, cluster ID, bucket name (length-prefixed, ≤ 128 bytes), shard, shard count S, per-shard ordinal, tier, creation time, epoch; **cipher ID** (0 = none) and **key generation** (0 when unencrypted).
+- **Volume header:** volume ID, cluster ID, bucket name (length-prefixed, ≤ 128 bytes), shard, shard count S, per-shard volume number, tier, creation time, epoch; **cipher ID** (0 = none) and **key generation** (0 when unencrypted).
 - **Record** (proposed layout — fix when writing `docs/format-v1.md`; this is the permanent part to review): fixed header, then two regions:
   `magic | type | flags | seq | check | name_len (u16) | meta_len (u32) | payload_len (u32) | A | header_CRC | B | payload_CRC`
   - **A** = `name ‖ sha256 (32 B) ‖ metadata ‖ tag_A`, **B** = `payload ‖ tag_B`. Tags are 0 bytes for cipher 0 and 16 bytes (GCM) otherwise. Each region is its own encryption unit with its own sub-key (§11), so dedup checks, `HEAD` and metadata reads read and decrypt only the small region A (metadata ≤ 16 KiB), never the payload.
@@ -209,7 +209,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 - **Scrub (`scan verify`):** rebuild in memory and compare with every replica's `.nidx` and `.idx`.
 - **Readers opened on demand:** an owner opens a volume's `.nidx` when a lookup needs it (from a local replica, or a cached local copy fetched from a replica) and reads buckets with positioned reads through the injectable FS — no mmap, no block cache; the OS page cache does the caching. Only file handles are managed: a bounded LRU, closed on idle timeout. Access is heavily biased to recent data, so cold buckets cost nothing until touched.
 
-**Lookup of (bucket, name)** on the shard owner: in-memory maps of the shard's open volumes first, then the shard's sealed volumes **newest ordinal first**; per volume, a miss costs one (usually cached) hash-table bucket read; the first verified hit is the latest version. The erasure list (cached on the owner) filters erased versions. Per lookup this touches the shard's few volumes of that bucket (usually 1–3, more with late-data straggler volumes), not the whole bucket.
+**Lookup of (bucket, name)** on the shard owner: in-memory maps of the shard's open volumes first, then the shard's sealed volumes **newest volume number first**; per volume, a miss costs one (usually cached) hash-table bucket read; the first verified hit is the latest version. The erasure list (cached on the owner) filters erased versions. Per lookup this touches the shard's few volumes of that bucket (usually 1–3, more with late-data straggler volumes), not the whole bucket.
 
 **Every read verifies the record against the index entry:** magic, header CRC, seq, check, **name**, payload CRC. A wrong or stale index entry is detected, never served as another file; on mismatch the node rebuilds the index file.
 
@@ -232,7 +232,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 - Same volume on several disks: dedupe by volume ID, prefer valid seal + highest epoch.
 - Replica differs only in records of type erased-file: an erasure not yet applied to the other copy — finish it, don't report corruption.
 - Unsealed volumes: accept CRC-valid records; trailing unacked writes become orphans that a later write of the same name supersedes.
-- Catalogue rebuild recovers buckets, shards, ordinals and replica locations from volume headers; "latest version" per name falls out of (ordinal, seq).
+- Catalogue rebuild recovers buckets, shards, volume numbers and replica locations from volume headers; "latest version" per name falls out of (volume number, seq).
 - v2 content needs keys: the scanner reads them from the catalogue or a key export.
 
 **One tool, two modes:** *verify* (scan + diff against catalogue and index files = scheduled scrub; no keys needed for v1 structure) and *rebuild* (insert findings, rewrite index files; after `store db init --cluster-id` on an empty database, §13).
@@ -253,14 +253,14 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 
 **No separate catalogue server.** The catalogue package inside the binary is the API; PostgreSQL is the only source of truth.
 
-**Who talks to PostgreSQL:** storage nodes and tools directly (short transactions: shard leases, open/seal volume with ordinal, cached location lookups, key fetch, disk-stat heartbeats, erasure list). Never per file. Only `store db` runs DDL. Application clients never — they talk HTTP to any storage node.
+**Who talks to PostgreSQL:** storage nodes and tools directly (short transactions: shard leases, open/seal volume with volume number, cached location lookups, key fetch, disk-stat heartbeats, erasure list). Never per file. Only `store db` runs DDL. Application clients never — they talk HTTP to any storage node.
 
 **Coordinator (post-MVP) = singleton elected via PostgreSQL advisory lock.** Duties: placement policy, repair queue, down→re-replicate transitions (gone stays manual), retention deletes, erasure application, scrub scheduling, failure detection, planned shard rebalancing.
 - Every decision is a DB transaction on the lock-holding session → database fences split-brain.
 - Actions on disks via a task table (`SELECT … FOR UPDATE SKIP LOCKED`), executed idempotently.
 
 **Replication and failover — the catalogue must never go back in time:**
-- **Synchronous replication** (e.g. `synchronous_standby_names = ANY 1 (s1, s2)`). Write rate is tiny (leases, volume opens/seals), so the cost is negligible. Leases, epochs, ordinals, bucket state, erasure list — and from v2, keys — cannot be lost.
+- **Synchronous replication** (e.g. `synchronous_standby_names = ANY 1 (s1, s2)`). Write rate is tiny (leases, volume opens/seals), so the cost is negligible. Leases, epochs, volume numbers, bucket state, erasure list — and from v2, keys — cannot be lost.
 - v2: a bucket key is committed (synchronously replicated) before any data is encrypted with it.
 - **Failover runbook:** promote standby → set a new **catalogue incarnation** (e.g. a timestamp) → nodes that see a changed incarnation drop all shard and volume leases and seal open volumes with epoch = max(catalogue, on-disk) + 1 → shard leases are re-acquired → verify node-ID uniqueness.
 - v2: **backups include keys.** Backup and key-export retention = the key-material retention bound N, which also bounds crypto-shredding lag (§11).
@@ -276,7 +276,7 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 2. Computes `shard = SHA-256(name) mod S` and the rendezvous owner of (bucket, shard); forwards metadata, body and hash. "Not owner, try X" → retry there.
 3. Owner (holding the shard lease) looks up the latest version (§7).
 4. Conditions: `If-None-Match: *` and a version exists → `412`; `If-Match` and the latest ETag differs → `412`.
-5. Latest version's sha256 equals the new hash → **`200`, nothing stored**.
+5. Latest version's sha256 equals the new hash **and** its metadata bytes equal the new metadata → **`200`, nothing stored** (metadata is compared only after a sha256 match, by reading region A of the latest record).
 6. Otherwise append to the shard's open volume (all replicas fsync, group commit), add to the in-memory name map → `201`.
 - Dedup compares **only with the latest version**: if content flips A → B → A (e.g. non-deterministic lossy compression), the second A is stored again. That keeps "latest" rebuildable from disk alone.
 - **Memory budget per node** (e.g. a few GB) guarded by a semaphore sized in bytes; when full → `503` + `Retry-After`. The body crosses the network twice (receiver → owner → replicas); at ≤ ~1 GB/s peak including duplicates this is acceptable.
@@ -335,10 +335,10 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 **Principle:** anything that ends up **on disk, in an ID space or in the API** is permanent — get it right now. Process behaviour can be simplified now and added later. Limits start tight; they can be loosened, never tightened.
 
 **Non-negotiable in the MVP (permanent or uncorrectable later):**
-- Fixed **prelude with format version** on every volume file; v1 format with typed records, seq, check, **name, sha256**, metadata, header CRC (covering the fixed header and region A), payload CRC, seal record. Volume header with bucket, **shard, S, ordinal, cipher ID (0 = none), key generation**. Record layout with **two regions (name ‖ sha256 ‖ metadata, payload) and their (empty) tag fields** (§7). Reserve record types (erased-file, metadata footer, chunk).
+- Fixed **prelude with format version** on every volume file; v1 format with typed records, seq, check, **name, sha256**, metadata, header CRC (covering the fixed header and region A), payload CRC, seal record. Volume header with bucket, **shard, S, volume number, cipher ID (0 = none), key generation**. Record layout with **two regions (name ‖ sha256 ‖ metadata, payload) and their (empty) tag fields** (§7). Reserve record types (erased-file, metadata footer, chunk).
 - **Shard function** `SHA-256(name) mod S`, S fixed per bucket and recorded in every volume header.
 - **Volume IDs = node ID + node-local counter**; seqs never reused within a volume (required for v2 nonces); cluster ID in volume header and node state.
-- **Shard leases**: only the catalogue-granted owner writes a (bucket, shard); handover seals the previous owner's volumes before writing. **Per-shard ordinals** from the catalogue; latest = highest (ordinal, seq).
+- **Shard leases**: only the catalogue-granted owner writes a (bucket, shard); handover seals the previous owner's volumes before writing. **Per-shard volume numbers** from the catalogue; latest = highest (volume number, seq).
 - **Write correctness:** all-replica fsync before ack, volume lease + epoch fencing, seal-on-failure (incl. ENOSPC). Dedup only against the latest version.
 - **Read correctness:** every read verifies the record header (magic, CRC, seq, check, name) against the index entry — indexes are only caches.
 - Volume size cap ≤ 32 GiB.
@@ -381,7 +381,7 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 - Trusting an index entry without verifying seq, check and name in the record header.
 - Putting content hashes (or, once encrypted, plaintext names) into index files.
 - Resuming an open volume after a restart instead of sealing it and opening a new one.
-- Volume IDs or ordinals from anything that can go back in time (PostgreSQL sequences without sync replication, local clocks).
+- Volume IDs or volume numbers from anything that can go back in time (PostgreSQL sequences without sync replication, local clocks).
 - Reusing a seq within a volume (breaks v2 nonce uniqueness).
 - Async catalogue replication.
 - Skipping CRCs or epochs.
@@ -457,7 +457,7 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 | Forever | HTTP API contract (paths, digest/condition semantics), bucket-name and file-name rules, shard function, ID spaces (node, volume, cluster), seq-never-reused rule | Get right before the first client integrates |
 | Application's choice | Bucket and name conventions (e.g. `<class>-<UTC day>`, `<timestamp>/<uuid>/<role>`), per-bucket S | Changeable for new buckets at any time |
 | Life of the data (5 years, up to 15–20 with extended retention) | On-disk format v1 (all ciphers), EC shards; record framing incl. the two-region layout, name and sha256; CRC choice; metadata size limit; nonce construction | Readers support every version and cipher ever written; prelude identifies version |
-| Life of the deployment | Migration mechanism (`schema_migrations`, `catalogue_meta`, compat checks); erasure and deletion lists; per-shard ordinals | Must exist in release one |
+| Life of the deployment | Migration mechanism (`schema_migrations`, `catalogue_meta`, compat checks); erasure and deletion lists; per-shard volume numbers | Must exist in release one |
 | Changeable | `.idx` / `.nidx` formats (rebuildable caches), internal locator encoding, routing details, placement, group-commit window, memory budget, idle timeouts, index cache policy, coordinator, repair automation, key hierarchy, PG topology | Simplify freely in MVP |
 
 ## 13. Catalogue initialisation and schema migration
@@ -514,7 +514,7 @@ Nodes and tools **never run DDL**; they only check compatibility.
 
 **New installation:** `store db bootstrap-sql` (DBA runs it) → `store db init --cluster-name X` → `store admin assign-node-id` per node → start nodes.
 
-**Catalogue rebuild from disks:** empty database → `store db init --cluster-name X --cluster-id <from volume headers>` → `store scan rebuild` (buckets, shards, ordinals and locations from volume headers; re-applies the exported erasure list; v2 also needs the key export).
+**Catalogue rebuild from disks:** empty database → `store db init --cluster-name X --cluster-id <from volume headers>` → `store scan rebuild` (buckets, shards, volume numbers and locations from volume headers; re-applies the exported erasure list; v2 also needs the key export).
 
 **Wrong-database protection:**
 - Nodes and tools never auto-initialise; an empty or uninitialised database → refuse.
@@ -557,14 +557,14 @@ cmd/store/  wiring only
 |---|---|---|---|
 | L0 pure | format, names, shard function, CRC, nonce construction, `.nidx` table encode/decode | Table tests, round-trip properties, Go fuzzing (decoder never panics on corrupt bytes; scanner resyncs), golden files per format version kept forever | ms |
 | L1 component | volume writer, erasure, `.idx`, `.nidx` | In-memory and fault-injecting FS: short writes, fsync errors, ENOSPC, torn writes, crash at any write → reopen and check committed state; corrupted / truncated / wrong-version index → detected on read and rebuilt; fingerprint collisions handled (extra read, never a wrong answer); no content hash or plaintext name in any index file | ms |
-| L2 catalogue | queries, shard/volume leases, ordinals, epochs, migrations | PostgreSQL in a container (testcontainers-go), DB per test package. Migrations: empty → latest, each released snapshot → latest, run twice, `verify`. Competing sessions for leases and the advisory lock | s |
+| L2 catalogue | queries, shard/volume leases, volume numbers, epochs, migrations | PostgreSQL in a container (testcontainers-go), DB per test package. Migrations: empty → latest, each released snapshot → latest, run twice, `verify`. Competing sessions for leases and the advisory lock | s |
 | Contract | fake vs real catalogue | Same suite runs against the in-memory fake and PostgreSQL — keeps the fake honest for the simulator | s |
 | L3 simulation | multi-node orchestration | N nodes in one process, in-memory disks/transport/catalogue, seeded deterministic scheduler, virtual clock. Faults: crashes, disk loss, partitions, slow replicas, shard handover, catalogue failover. Invariants checked after every step; failing seeds replay exactly | ms/run, thousands of seeds in CI |
 | L4 end-to-end | real binaries | Docker Compose: PostgreSQL primary + standby, 3–5 nodes, small loop/tmpfs disks. `kill -9`, disk full, failover runbook, shard handover, `scan rebuild` drill | min, nightly |
 
 **Simulation invariants (write first):**
 - Every acknowledged `PUT` stays readable by name while at least one replica survives, until a newer version or an erase.
-- `GET` by name always returns the latest acknowledged version (highest ordinal, seq).
+- `GET` by name always returns the latest acknowledged version (highest volume number, seq).
 - A `PUT` with content identical to the latest version never stores anything.
 - At most one node holds a (bucket, shard) lease, and only it appends to that shard's volumes.
 - No volume ever has two active writers; no seq reused within a volume.

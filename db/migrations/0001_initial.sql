@@ -51,7 +51,7 @@ CREATE TABLE buckets (
 CREATE TABLE shards (
   bucket           text   NOT NULL REFERENCES buckets (name),
   shard            int    NOT NULL CHECK (shard >= 0),
-  next_ordinal     bigint NOT NULL DEFAULT 1,
+  next_volume_number     bigint NOT NULL DEFAULT 1,
   lease_node       int    REFERENCES nodes (node_id),
   lease_generation bigint NOT NULL DEFAULT 0,
   lease_expires_ms bigint,
@@ -62,7 +62,7 @@ CREATE TABLE volumes (
   volume_id        text   NOT NULL PRIMARY KEY CHECK (length(volume_id) = 16 AND volume_id = lower(volume_id)),
   bucket           text   NOT NULL,
   shard            int    NOT NULL,
-  ordinal          bigint NOT NULL,
+  volume_number          bigint NOT NULL,
   state            text   NOT NULL CHECK (state IN ('open', 'sealing', 'sealed')),
   epoch            int    NOT NULL,
   format_major     int    NOT NULL,
@@ -73,11 +73,11 @@ CREATE TABLE volumes (
   record_count     bigint,
   created_ms       bigint NOT NULL,
   sealed_ms        bigint,
-  UNIQUE (bucket, shard, ordinal),
+  UNIQUE (bucket, shard, volume_number),
   FOREIGN KEY (bucket, shard) REFERENCES shards (bucket, shard)
 );
 
-CREATE INDEX volumes_by_shard ON volumes (bucket, shard, ordinal DESC);
+CREATE INDEX volumes_by_shard ON volumes (bucket, shard, volume_number DESC);
 
 CREATE TABLE volume_replicas (
   volume_id text NOT NULL REFERENCES volumes (volume_id),

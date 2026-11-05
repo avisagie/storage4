@@ -190,12 +190,12 @@ type Replica struct {
 
 // Volume is a volume's catalogue record.
 type Volume struct {
-	ID      VolumeID
-	Bucket  string
-	Shard   int
-	Ordinal int64 // per (bucket, shard); latest version = highest (ordinal, seq)
-	State   VolumeState
-	Epoch   uint32 // 1 at creation, +1 per BeginSeal
+	ID           VolumeID
+	Bucket       string
+	Shard        int
+	VolumeNumber int64 // per (bucket, shard); latest version = highest (volume number, seq)
+	State        VolumeState
+	Epoch        uint32 // 1 at creation, +1 per BeginSeal
 
 	FormatMajor, FormatMinor uint16
 	CipherID, Tier           uint16
@@ -221,7 +221,7 @@ type OpenParams struct {
 // Volumes manages volumes and their replicas.
 type Volumes interface {
 	// OpenVolume, under the lease and in one transaction, assigns the shard's
-	// next ordinal and inserts the volume (open, epoch 1) with its replicas.
+	// next volume number and inserts the volume (open, epoch 1) with its replicas.
 	// ErrLeaseLost, ErrVolumeExists, ErrUnknownDisk, ErrDiskUnavailable,
 	// ErrInvalidArgument.
 	OpenVolume(ctx context.Context, l Lease, p OpenParams) (Volume, error)
@@ -237,7 +237,7 @@ type Volumes interface {
 	FinishSeal(ctx context.Context, l Lease, id VolumeID, epoch uint32, committed int64, records uint32) error
 	// GetVolume returns ErrVolumeNotFound for an unknown ID.
 	GetVolume(ctx context.Context, id VolumeID) (Volume, error)
-	// ListShardVolumes returns every volume of the shard, newest ordinal
+	// ListShardVolumes returns every volume of the shard, newest volume number
 	// first (lookup order), including open and sealing ones.
 	ListShardVolumes(ctx context.Context, bucket string, shard int) ([]Volume, error)
 	// ListDiskVolumes returns the volumes with a replica on the disk, in any

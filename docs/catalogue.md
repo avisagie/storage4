@@ -1,10 +1,10 @@
 # Catalogue (`catalogue/`, `db/`)
 
-Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat`, `catalogue/cattest`, `db/`); design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). Approved 2026-11-05 (human gate): interface, migration 0001 (frozen) and the lease/ordinal/epoch SQL. Rationale: design-notes §6, §8, §13.
+Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat`, `catalogue/cattest`, `db/`); design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). Approved 2026-11-05 (human gate): interface, migration 0001 (frozen) and the lease/volume-number/epoch SQL. Rationale: design-notes §6, §8, §13.
 
 ## Scope
 
-- `catalogue.Catalogue` is the **runtime API for nodes and tools**: buckets, shard leases and ordinals, volumes and replicas, the erasure list, nodes and disks. It never runs DDL and never initialises anything.
+- `catalogue.Catalogue` is the **runtime API for nodes and tools**: buckets, shard leases and volume numbers, volumes and replicas, the erasure list, nodes and disks. It never runs DDL and never initialises anything.
 - `db/` is the **DDL side** (`store db init|migrate|status|verify`, embedded migrations). It is not part of the `Catalogue` interface, so no node can reach it.
 - Three implementations behind one contract suite: PostgreSQL (`pgx`, production), SQLite (`modernc.org/sqlite`, tests/dev only), in-memory fake (simulator). All three are constructed with an **injected `Clock`**.
 - Small, per-concern interfaces (`Buckets`, `Leases`, `Volumes`, `Erasures`, `Cluster`) composed into `Catalogue`, so tests and the simulator can fake or wrap one concern.
@@ -20,7 +20,7 @@ Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat
 
 1. **Fencing, not clocks, protects data.** A shard lease carries a monotonic `Generation`. Every catalogue write by an owner (open volume, begin/finish seal, add erasures) is a single compare-and-set on `(node, generation, not expired)`. Replicas independently reject stale volume epochs. A skewed clock can therefore delay or hasten a handover but can never let two owners ack writes.
 2. **Time comes from the injected `Clock`** (milliseconds stored as `bigint`), never from the database's `now()`. This keeps PostgreSQL, SQLite and the fake identical, and lets `sim/` use virtual time. Cost: lease expiry depends on node clock skew (seconds, against 30 s leases); acceptable because of rule 1.
-3. **Generation, ordinal and epoch only move forward.** The shard row is permanent (never deleted on release), so they cannot rewind. `ReleaseShard` clears the holder, keeps the row.
+3. **Generation, volume number and epoch only move forward.** The shard row is permanent (never deleted on release), so they cannot rewind. `ReleaseShard` clears the holder, keeps the row.
 4. **Leases are plain transactions** (single-statement compare-and-set with `RETURNING`): no advisory locks, no `SKIP LOCKED`, so all three implementations pass the same suite.
 5. **A catalogue outage fails writes** (`ErrUnavailable`): no lease can be granted or renewed. Reads of cached data are the node's business.
 6. Errors are sentinels (`errors.Is`), listed below; every method returns `ctx` errors and database errors wrapped.
@@ -33,17 +33,17 @@ The Go interface in `catalogue/catalogue.go` is the source of truth (every metho
 |---|---|
 | `Buckets` | `CreateBucket` (idempotent; conflict on different S; deleted refuses), `GetBucket`, `DeleteBucket` (also clears the bucket's shard leases), `ListBuckets` |
 | `Leases` | `AcquireShard`, `RenewShard`, `ReleaseShard`, `ShardOwner` |
-| `Volumes` | `OpenVolume(lease, OpenParams)`, `BeginSeal`, `FinishSeal`, `GetVolume`, `ListShardVolumes` (newest ordinal first), `ListDiskVolumes`, `SetReplicaState`, `AddReplica` |
+| `Volumes` | `OpenVolume(lease, OpenParams)`, `BeginSeal`, `FinishSeal`, `GetVolume`, `ListShardVolumes` (newest volume number first), `ListDiskVolumes`, `SetReplicaState`, `AddReplica` |
 | `Erasures` | `AddErasures`, `ShardErasures`, `PendingErasures`, `MarkErasureApplied`, `ListErasures` (paged export) |
 | `Cluster` | `AssignNodeID`, `RegisterDisk`, `SetDiskState`, `Heartbeat`, `LiveNodes`, `Disks` |
 
 Details settled while writing the contract suite (all enforced by `cattest`):
-- `OpenVolume` requires the volume ID's node part to equal the lease holder's node ID, distinct registered **active** disks, and `CipherID` equal to the bucket's. Refusals consume no ordinal.
+- `OpenVolume` requires the volume ID's node part to equal the lease holder's node ID, distinct registered **active** disks, and `CipherID` equal to the bucket's. Refusals consume no volume number.
 - `AddReplica` only for **sealed** volumes and active disks; the new replica gets a pending erasure target for every erasure of the volume, because it was copied from a replica that may not have applied them yet. `AddErasures` creates targets only for non-lost replicas.
 - `FinishSeal` is a no-op when repeated with the same values, `ErrSealMismatch` with different ones, `ErrEpochMismatch` if another `BeginSeal` intervened.
 - `RenewShard` of an expired but untaken lease succeeds; of a superseded or cleared one, `ErrLeaseLost`.
 - `SetDiskState`: `gone` is terminal (`ErrDiskGone`). `Heartbeat` refuses unknown nodes (`ErrNodeNotFound`), a second live instance of a node ID (`ErrNodeIDInUse`) and disks not registered to that node.
-- Ordering contracts: `ListShardVolumes` by ordinal descending, `ListDiskVolumes` by volume ID, `Disks` by disk ID, erasure lists by (volume, seq).
+- Ordering contracts: `ListShardVolumes` by volume number descending, `ListDiskVolumes` by volume ID, `Disks` by disk ID, erasure lists by (volume, seq).
 
 Errors: `ErrNotInitialised`, `ErrUnavailable`, `ErrInvalidArgument`, `ErrBucketNotFound`, `ErrBucketConflict`, `ErrBucketDeleted`, `ErrLeaseHeld` (as `*HeldError{Node, Expires}`), `ErrLeaseLost`, `ErrVolumeNotFound`, `ErrVolumeExists`, `ErrVolumeSealed`, `ErrVolumeNotSealed`, `ErrEpochMismatch`, `ErrSealMismatch`, `ErrReplicaNotFound`, `ErrErasureNotFound`, `ErrNodeNotFound`, `ErrNodeIDInUse`, `ErrNodeIDsExhausted`, `ErrUnknownDisk`, `ErrDiskConflict`, `ErrDiskUnavailable`, `ErrDiskGone`.
 
@@ -52,7 +52,7 @@ Errors: `ErrNotInitialised`, `ErrUnavailable`, `ErrInvalidArgument`, `ErrBucketN
 1. New owner: `AcquireShard` (generation g+1; the old owner's catalogue writes now fail).
 2. `ListShardVolumes` → for each `open`/`sealing` volume: `BeginSeal` (epoch bump fences the old writer at the replicas) → replicas `SealFile` at the minimum committed length → `FinishSeal`. Crash anywhere: the next owner repeats; every step is repeatable.
 3. Normal seal (full, idle, replica failure): the same three calls by the current owner.
-4. `OpenVolume` for the replacement volume assigns the next ordinal in the same transaction as the insert.
+4. `OpenVolume` for the replacement volume assigns the next volume number in the same transaction as the insert.
 
 ## Lease SQL (portable; `$now` is the injected clock in Unix milliseconds)
 
@@ -69,11 +69,11 @@ RETURNING lease_generation;
 UPDATE shards SET lease_expires_ms = $now + $ttl_ms
  WHERE bucket = $bucket AND shard = $shard AND lease_node = $node AND lease_generation = $gen;
 
--- OpenVolume: ordinal and lease check in one statement, same transaction as the INSERTs
-UPDATE shards SET next_ordinal = next_ordinal + 1
+-- OpenVolume: volume number and lease check in one statement, same transaction as the INSERTs
+UPDATE shards SET next_volume_number = next_volume_number + 1
  WHERE bucket = $bucket AND shard = $shard AND lease_node = $node AND lease_generation = $gen
    AND lease_expires_ms > $now
-RETURNING next_ordinal - 1;
+RETURNING next_volume_number - 1;
 
 -- BeginSeal
 UPDATE volumes SET epoch = epoch + 1, state = 'sealing'
@@ -100,12 +100,12 @@ disks(disk_id text PK, node_id int REFERENCES nodes, state text CHECK (state IN 
 buckets(name text PK, shards int CHECK (shards BETWEEN 1 AND 1024),
         state text CHECK (state IN ('active','deleted','restored')), cipher_id int DEFAULT 0 CHECK (cipher_id IN (0,1)),
         created_ms bigint, deleted_ms bigint)
-shards(bucket text REFERENCES buckets, shard int, next_ordinal bigint DEFAULT 1,
+shards(bucket text REFERENCES buckets, shard int, next_volume_number bigint DEFAULT 1,
        lease_node int, lease_generation bigint DEFAULT 0, lease_expires_ms bigint, PRIMARY KEY (bucket, shard))
-volumes(volume_id text PK, bucket text, shard int, ordinal bigint,
+volumes(volume_id text PK, bucket text, shard int, volume_number bigint,
         state text CHECK (state IN ('open','sealing','sealed')), epoch int, format_major int, format_minor int,
         cipher_id int, tier int, committed_length bigint, record_count bigint, created_ms bigint, sealed_ms bigint,
-        UNIQUE (bucket, shard, ordinal), FOREIGN KEY (bucket, shard) REFERENCES shards)
+        UNIQUE (bucket, shard, volume_number), FOREIGN KEY (bucket, shard) REFERENCES shards)
 volume_replicas(volume_id text REFERENCES volumes, disk_id text REFERENCES disks,
                 state text CHECK (state IN ('ok','failed','lost')), PRIMARY KEY (volume_id, disk_id))
 erasures(volume_id text REFERENCES volumes, seq bigint, chk bigint, created_ms bigint, PRIMARY KEY (volume_id, seq))
@@ -113,7 +113,7 @@ erasure_targets(volume_id text, seq bigint, disk_id text REFERENCES disks, appli
                 PRIMARY KEY (volume_id, seq, disk_id), FOREIGN KEY (volume_id, seq) REFERENCES erasures)
 ```
 
-Indexes: `volumes(bucket, shard, ordinal DESC)`, `volume_replicas(disk_id)`, `erasure_targets(disk_id) WHERE applied_ms IS NULL` (PostgreSQL partial; SQLite supports it too).
+Indexes: `volumes(bucket, shard, volume_number DESC)`, `volume_replicas(disk_id)`, `erasure_targets(disk_id) WHERE applied_ms IS NULL` (PostgreSQL partial; SQLite supports it too).
 
 Not in 0001 (added by later expand migrations when needed): bucket keys (encryption), retention/tier tables, the task table for the post-MVP coordinator.
 
@@ -123,7 +123,7 @@ Not in 0001 (added by later expand migrations when needed): bucket keys (encrypt
 2. **Volume and disk IDs as hex text**, times as `bigint` Unix milliseconds (matches `time.UnixMilli` and Java; rescue-friendly, portable) rather than `uuid`/`timestamptz`.
 3. **One portable migration set** for PostgreSQL and SQLite, restricted to the common subset (no `~` regex checks, no enums, no `timestamptz`), instead of a directory per dialect. The PostgreSQL `verify` snapshot still checks the live PostgreSQL schema.
 4. **Two-phase seal** (`BeginSeal` then `FinishSeal`) so the epoch fence is committed before replicas are told to seal.
-5. **Permanent shard rows** hold lease, generation and `next_ordinal`; released leases keep the row (rows = shards ever written).
+5. **Permanent shard rows** hold lease, generation and `next_volume_number`; released leases keep the row (rows = shards ever written).
 6. **`DeleteBucket` of a never-created bucket returns `ErrBucketNotFound`** (the node answers `404`, not `202`), so a typo cannot block a name forever. `api.md` §2.6 says "idempotent" without covering this case.
 7. **`SetReplicaState`/`AddReplica` are not lease-gated** (owner and admin both need them); `AddErasures` is (owner-only; an admin erase acquires the shard lease like a node).
 8. **Node ID range 1..65535**, volume ID node part = node ID; `AssignNodeID(name)` takes the operator-chosen node name (e.g. the host name) and is idempotent per name: a retried admin script gets the same ID back and never burns a second one.
