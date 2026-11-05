@@ -98,3 +98,4 @@ cmd/store/  flags, signals, calls node.Start — wiring only
 - One package or behaviour per task. Read the design-notes section first; state which invariant the change touches and which test layer covers it.
 - Keep diffs small and reviewable; no drive-by refactors.
 - Update `docs/` in the same change when behaviour, API or format documentation changes.
+- Update `mvp-plan.md` in every commit that finishes, starts or changes a milestone (status, decisions with dates, open items), so the plan never lags the code.
