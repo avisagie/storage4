@@ -37,7 +37,7 @@ type Tool struct {
 	Rand       io.Reader   // for the cluster ID; used by Init only
 	Migrations []Migration // default: Embedded()
 	NodeTTL    time.Duration
-	AppliedBy  string // recorded in schema_migrations: binary version and host
+	AppliedBy  string // recorded in schema_migrations: binary version and host, e.g. "1.2.14+1a2b3c4d@store-a1"; 1..256 bytes
 }
 
 // advisoryKey is the fixed pg_advisory_xact_lock key of `store db`.
@@ -103,7 +103,7 @@ const migrationsTable = `CREATE TABLE IF NOT EXISTS schema_migrations (
   kind       text   NOT NULL CHECK (kind IN ('expand', 'contract')),
   sha256     text   NOT NULL,
   applied_ms bigint NOT NULL,
-  applied_by text   NOT NULL
+  applied_by text   NOT NULL CHECK (length(applied_by) BETWEEN 1 AND 256)
 )`
 
 // readMeta returns the catalogue_meta row, or ok=false if the catalogue is

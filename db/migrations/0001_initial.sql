@@ -23,7 +23,7 @@ CREATE TABLE node_beats (
   node_id        int    NOT NULL PRIMARY KEY REFERENCES nodes (node_id),
   instance       text   NOT NULL,
   addr           text   NOT NULL,
-  binary_version text   NOT NULL,
+  binary_version text   NOT NULL CHECK (length(binary_version) BETWEEN 1 AND 128), -- informational: major.minor.build+hash
   compat         int    NOT NULL,
   seen_ms        bigint NOT NULL
 );

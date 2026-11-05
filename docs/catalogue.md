@@ -10,6 +10,12 @@ Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat
 - Small, per-concern interfaces (`Buckets`, `Leases`, `Volumes`, `Erasures`, `Cluster`) composed into `Catalogue`, so tests and the simulator can fake or wrap one concern.
 - No per-file rows, ever. Every method is one short transaction.
 
+## Versions: three different things
+
+- **Schema version**: an integer, the number of the last applied migration (`catalogue_meta.schema_version`). A binary carries `requires_schema` and refuses a lower schema.
+- **Compat level**: an integer per binary, compared with `catalogue_meta.min_compat` (raised by contract migrations). Bumped by hand in code, never derived from the version string.
+- **Binary version**: SemVer text `major.minor.build+hash[.dirty]`, built by `scripts/version.sh` from the latest git tag `vMAJOR.MINOR`, the commits since it (`build`), the first 8 hex digits of the commit, and `.dirty` for uncommitted changes (`make build` passes it as `-ldflags -X main.version=...`). **Informational only**: stored as `node_beats.binary_version` and `schema_migrations.applied_by` (`version@host`), shown by `store db status`, never compared.
+
 ## Rules the interface bakes in
 
 1. **Fencing, not clocks, protects data.** A shard lease carries a monotonic `Generation`. Every catalogue write by an owner (open volume, begin/finish seal, add erasures) is a single compare-and-set on `(node, generation, not expired)`. Replicas independently reject stale volume epochs. A skewed clock can therefore delay or hasten a handover but can never let two owners ack writes.

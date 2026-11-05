@@ -1,4 +1,4 @@
-.PHONY: check fmt vet staticcheck test build
+.PHONY: check fmt vet staticcheck test build version
 
 check: fmt vet staticcheck test
 
@@ -14,8 +14,13 @@ staticcheck:
 test:
 	go test -race ./...
 
+VERSION := $(shell scripts/version.sh)
+
 build:
-	CGO_ENABLED=0 go build -o bin/store ./cmd/store
+	CGO_ENABLED=0 go build -ldflags "-X main.version=$(VERSION)" -o bin/store ./cmd/store
+
+version:
+	@scripts/version.sh
 
 .PHONY: pg-start pg-stop
 pg-start:
