@@ -279,6 +279,30 @@ func TestReadHeadVerifies(t *testing.T) {
 	}
 }
 
+func TestReadHeadAt(t *testing.T) {
+	fsys := disk.NewMem(disk.MemOptions{})
+	w, _ := Create(fsys, hdr(), Options{Rand: counter()})
+	locs, _ := w.Append([]Entry{entry("a", 20), entry("b", 20)})
+	f := open(t, fsys)
+	h, err := ReadHeadAt(f, locs[0].Off, locs[0].Seq, "a")
+	if err != nil || h.Locator() != locs[0] {
+		t.Fatalf("%+v %v", h, err)
+	}
+	// Another name at a valid record: a name mismatch, distinguishable from a stale pointer.
+	if _, err := ReadHeadAt(f, locs[0].Off, locs[0].Seq, "b"); !errors.Is(err, ErrNameMismatch) || !errors.Is(err, ErrMismatch) {
+		t.Errorf("name: %v", err)
+	}
+	// Wrong seq, and an offset in the middle of a record: ErrMismatch without ErrNameMismatch.
+	for _, tc := range []struct {
+		off int64
+		seq uint32
+	}{{locs[0].Off, 9}, {locs[0].Off + 8, 1}} {
+		if _, err := ReadHeadAt(f, tc.off, tc.seq, "a"); !errors.Is(err, ErrMismatch) || errors.Is(err, ErrNameMismatch) {
+			t.Errorf("%+v: %v", tc, err)
+		}
+	}
+}
+
 func TestStreamingReadDetectsPayloadCorruption(t *testing.T) {
 	fsys := disk.NewMem(disk.MemOptions{})
 	w, _ := Create(fsys, hdr(), Options{Rand: counter()})

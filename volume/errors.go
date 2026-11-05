@@ -23,6 +23,10 @@ var (
 	// ErrMismatch means a record does not match its locator (seq, check,
 	// length or name): a stale or wrong index entry, or corruption.
 	ErrMismatch = errors.New("volume: record does not match locator")
+	// ErrNameMismatch is wrapped together with ErrMismatch when the record is
+	// structurally what the locator says but holds another name: an index
+	// fingerprint collision, not a stale index.
+	ErrNameMismatch = errors.New("volume: record holds another name")
 	// ErrErased means the record has been erased.
 	ErrErased = errors.New("volume: record erased")
 	// ErrNotFileRecord means the locator points at a record that is not a

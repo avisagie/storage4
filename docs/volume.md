@@ -11,7 +11,7 @@ Status: seal and seq logic approved 2026-11-05. `volume/` manages **one replica 
 | `Writer.Seal(epoch)` | Seal record at `Committed()`, one `Sync`; closes the writer. |
 | `SealFile(fsys, path, committed, epoch, rnd)` | Seal a replica without a (working) writer: restart, handover, replica failure. |
 | `Scan(file, fn)` | Streaming scan of the longest valid prefix; calls `fn` per record; payloads are CRC-checked in 1 MiB chunks. |
-| `ReadHead` / `Head.Payload` / `Head.ReadAll` | Header-verifying read. |
+| `ReadHead` / `ReadHeadAt` / `Head.Payload` / `Head.ReadAll` | Header-verifying read. `ReadHeadAt(f, off, seq, name)` is for `.nidx` entries, which carry only seq and offset: check and length come from the record's own header; a valid record of another name wraps `ErrNameMismatch` (a fingerprint collision), anything else `ErrMismatch` only (stale index). |
 | `Writer.Idx()`, `WriteIdx`, `BuildIdx`, `RebuildIdx`, `EnsureIdx`, `DecodeIdx` | Seq index of a sealed volume (below). |
 | `Erase(file, items)` | In-place erasure per format-v1 §7, one fsync per batch. |
 

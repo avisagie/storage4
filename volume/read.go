@@ -58,10 +58,30 @@ func ReadHead(f disk.File, loc Locator, name string) (*Head, error) {
 		return nil, fmt.Errorf("volume read @%d: type %d: %w", loc.Off, r.Type, ErrNotFileRecord)
 	}
 	if !bytes.Equal(r.Name, []byte(name)) {
-		return nil, fmt.Errorf("volume read @%d: name: %w", loc.Off, ErrMismatch)
+		return nil, fmt.Errorf("volume read @%d: name: %w: %w", loc.Off, ErrMismatch, ErrNameMismatch)
 	}
 	return h, nil
 }
+
+// ReadHeadAt is ReadHead for an index that knows only seq and offset (a
+// .nidx entry): check and length are taken from the record's own fixed
+// header, and everything else (header CRC, seq, name) is still verified. A
+// record that is not what the index claims yields ErrMismatch; a valid record
+// of another name additionally wraps ErrNameMismatch.
+func ReadHeadAt(f disk.File, off int64, seq uint32, name string) (*Head, error) {
+	var fixed [format.RecordHeaderLen]byte
+	if err := readFull(f, fixed[:], off); err != nil {
+		return nil, fmt.Errorf("volume read @%d: %w", off, err)
+	}
+	fh, err := format.ParseFixedHeader(fixed[:])
+	if err != nil {
+		return nil, fmt.Errorf("volume read @%d: %w: %w", off, ErrMismatch, err)
+	}
+	return ReadHead(f, Locator{Seq: seq, Check: fh.Check, Off: off, Len: uint32(fh.Len(0))}, name)
+}
+
+// Locator returns the verified locator of the record.
+func (h *Head) Locator() Locator { return h.loc }
 
 // Payload returns a reader for the payload. It streams from disk and checks
 // payload_CRC as it goes: when the last byte has been read it reports
