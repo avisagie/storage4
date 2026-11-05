@@ -1,6 +1,6 @@
 # Node (`node/`), single-node
 
-Status: milestone 6, **design for review (2026-11-05); no code yet.** Human gate: "Dedup and version ordering" (§5). Sources: design-notes §6, §9, §15; `docs/api.md`; `docs/volume.md`; `docs/nameindex.md`; `docs/catalogue.md`.
+Status: milestone 6, design approved 2026-11-05 (human gate: "Dedup and version ordering", §5); **implemented 2026-11-05, awaiting code review** (see "Implementation notes" at the end). Sources: design-notes §6, §9, §15; `docs/api.md`; `docs/volume.md`; `docs/nameindex.md`; `docs/catalogue.md`.
 
 Scope of milestone 6: one node, several local disks, real catalogue (mem, SQLite or PostgreSQL), HTTP API, no transport (no forwarding, no remote replicas). The node's shape (`Deps`, replica seam, goroutine ownership) is what `sim/` will drive in milestone 7, so it is fixed here.
 
@@ -143,3 +143,32 @@ Per open volume: one committer. Per node: one maintenance loop (lease renewals, 
 2. `Clock.After` added (§2); group commit without a window (§6).
 3. Fewer than three usable disks → `503`, no degraded mode (§3).
 4. `Lookup` change for erased candidates, scheduled in milestone 8 (§9).
+
+## Implementation notes (2026-11-05)
+
+Where the code settled details this document left open:
+
+- **Replicas are byte-identical.** Each replica's `volume.Writer` draws record `check` values from its own PCG, all seeded identically per volume from the node's random source, so every replica gets the same check and one locator serves all three. `commit` verifies that the replicas return equal locators.
+- **Registration order.** `OpenVolume` (catalogue) runs before the replica files are created, because the header needs the volume number the catalogue assigns. A crash in between leaves a registered volume with no files; recovery marks the replicas lost and finishes the seal with length 0. Lookups skip a volume with no usable replica.
+- **Suspect disks.** A replica that fails an append marks its disk suspect for 10 minutes (injected clock): no new volume is placed there. Operators decide "gone"; the catalogue's replica state `failed` records the replica.
+- **Bucket cache.** Bucket state is cached for 5 s (injected clock). `DELETE /b/{bucket}` clears this node's cache and abandons the bucket's open volumes at once (writers closed, no seal: the catalogue cleared the leases; pull-based GC removes the files).
+- **Idle and lease ticks.** One maintenance goroutine ticks every TTL/3: renews leases that are due, seals idle volumes, releases the lease of a shard with no open volume, closes idle index handles, refreshes disk states and heartbeats. A changed catalogue incarnation abandons all leases and raises `shard-lease-lost`.
+- **GET.** The first 64 KiB are read and CRC-verified before headers go out, so small files are fully verified before the first byte. Larger payloads stream and abort the connection on a CRC failure (decided 2026-11-05). `docs/api.md` §2.2 says a corrupt replica is skipped in favour of another; the node does not do that yet (lookup uses the first replica that serves the record). Open item.
+- **`Config.AllowSmallVolumes`** exists for tests only.
+- **Tests run on three catalogues**: `catalogue/mem`, SQLite and PostgreSQL (`db/dbtest.Catalogue`, shared with the contract suite). The PostgreSQL runs skip without `STORAGE4_TEST_PG_DSN`.
+
+Resolved the same day:
+
+- **Restart within `NodeTTL`**: `Cluster.Goodbye(node, instance)` added to the catalogue (interface, mem, SQL, contract test). `Stop` calls it last, so a restart does not wait out the heartbeat TTL. A crash still holds the node ID until `NodeTTL` has passed, by design.
+- **Fake vs SQL**: the only CHECK reachable through the interface that the fake did not mirror was the heartbeat's binary version (1..128 bytes); both now return `ErrInvalidArgument`, and the contract suite tests it. Rule going forward: every CHECK reachable through the interface gets a contract test.
+- **Replica fallback on a corrupt read**: the owner reads from its replicas (all local in milestone 6, remote through the transport in milestone 7). If a copy fails verification before any byte is sent (first 64 KiB, including the payload CRC), `GET` retries with another replica and raises a warning alarm; if none is intact it returns `500`, never wrong bytes. A failure after streaming has started still aborts the connection. Forwarding adds no second fallback: the receiving node simply relays what the owner returns.
+
+Still open:
+
+1. **testcontainers fallback** for `db/dbtest.OpenPostgres`: deferred (decided 2026-11-05); the local DSN is the default.
+2. **Single-node load tests** before milestone 6 closes (mvp-plan.md).
+3. **Zombie-owner reads** stay an accepted open thread (design-notes).
+
+## Future: disk management
+
+Today a failed append suspects the disk for 10 minutes (no new volumes there) and the replica is marked `failed`. Intended later, not built: a disk that fails an append or a verified read goes read-only in the catalogue automatically and raises an alarm to the operator; recovery and "gone" stay manual commands (design-notes §6, failure policy).

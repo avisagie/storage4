@@ -111,6 +111,7 @@ func Run(t *testing.T, f Factory) {
 		"Erasures":         testErasures,
 		"Cluster":          testCluster,
 		"Heartbeat":        testHeartbeat,
+		"Goodbye":          testGoodbye,
 		"ConcurrentLeases": testConcurrentLeases,
 		"ConcurrentOpen":   testConcurrentOpen,
 	} {
@@ -642,6 +643,38 @@ func testHeartbeat(t *testing.T, f Factory) {
 	e.must(err)
 	_, err = beat(1, inst1)
 	e.is(err, catalogue.ErrNodeIDInUse) // the old instance is now the intruder
+}
+
+func testGoodbye(t *testing.T, f Factory) {
+	e := newEnv(t, f)
+	e.cluster(2)
+	inst1, inst2 := [16]byte{1}, [16]byte{2}
+	beat := func(node catalogue.NodeID, inst [16]byte, version string) error {
+		_, err := e.c.Heartbeat(e.ctx, catalogue.NodeBeat{ID: node, Instance: inst, Version: version, Compat: 1}, nil)
+		return err
+	}
+	// Input limits are the same on every implementation (the schema has CHECKs).
+	e.is(beat(1, inst1, ""), catalogue.ErrInvalidArgument)
+	e.is(beat(1, inst1, string(make([]byte, 129))), catalogue.ErrInvalidArgument)
+	e.must(beat(1, inst1, "1.0"))
+	// A different instance's goodbye does nothing.
+	e.must(e.c.Goodbye(e.ctx, 1, inst2))
+	e.is(beat(1, inst2, "1.0"), catalogue.ErrNodeIDInUse)
+	// The right instance's goodbye frees the ID at once, and is repeatable.
+	e.must(e.c.Goodbye(e.ctx, 1, inst1))
+	e.must(e.c.Goodbye(e.ctx, 1, inst1))
+	if live, _ := e.c.LiveNodes(e.ctx); len(live) != 0 {
+		t.Fatalf("%+v", live)
+	}
+	e.must(beat(1, inst2, "1.1"))
+	// The old instance's late goodbye must not evict its successor.
+	e.must(e.c.Goodbye(e.ctx, 1, inst1))
+	if live, _ := e.c.LiveNodes(e.ctx); len(live) != 1 || live[0].ID != 1 {
+		t.Fatalf("%+v", live)
+	}
+	e.is(e.c.Goodbye(e.ctx, 9, inst1), catalogue.ErrNodeNotFound)
+	// A node that never beat can say goodbye too.
+	e.must(e.c.Goodbye(e.ctx, 2, inst1))
 }
 
 // Many nodes race for one shard: exactly one wins.

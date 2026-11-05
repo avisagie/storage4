@@ -87,6 +87,9 @@ func (c *Catalogue) SetDiskState(ctx context.Context, id catalogue.DiskID, s cat
 }
 
 func (c *Catalogue) Heartbeat(ctx context.Context, n catalogue.NodeBeat, disks []catalogue.DiskBeat) (catalogue.Meta, error) {
+	if len(n.Version) < 1 || len(n.Version) > 128 {
+		return catalogue.Meta{}, catalogue.ErrInvalidArgument
+	}
 	var meta catalogue.Meta
 	err := c.tx(ctx, false, func(tx *sql.Tx) error {
 		// The node row lock serialises heartbeats of one node ID, so two
@@ -141,6 +144,19 @@ func (c *Catalogue) Heartbeat(ctx context.Context, n catalogue.NodeBeat, disks [
 		return nil
 	})
 	return meta, err
+}
+
+func (c *Catalogue) Goodbye(ctx context.Context, node catalogue.NodeID, instance [16]byte) error {
+	return c.tx(ctx, false, func(tx *sql.Tx) error {
+		var one int
+		if err := c.row(ctx, tx, "SELECT 1 FROM nodes WHERE node_id = ?"+c.lockUpdate(), int(node)).Scan(&one); errors.Is(err, sql.ErrNoRows) {
+			return catalogue.ErrNodeNotFound
+		} else if err != nil {
+			return err
+		}
+		_, err := c.exec(ctx, tx, "DELETE FROM node_beats WHERE node_id = ? AND instance = ?", int(node), hex.EncodeToString(instance[:]))
+		return err
+	})
 }
 
 func (c *Catalogue) LiveNodes(ctx context.Context) ([]catalogue.NodeInfo, error) {

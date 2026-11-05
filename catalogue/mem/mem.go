@@ -694,6 +694,9 @@ func (c *Catalogue) Heartbeat(ctx context.Context, n catalogue.NodeBeat, disks [
 	if err := ctx.Err(); err != nil {
 		return catalogue.Meta{}, err
 	}
+	if len(n.Version) < 1 || len(n.Version) > 128 {
+		return catalogue.Meta{}, catalogue.ErrInvalidArgument
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	nr := c.nodes[n.ID]
@@ -715,6 +718,22 @@ func (c *Catalogue) Heartbeat(ctx context.Context, n catalogue.NodeBeat, disks [
 		d.d.CapacityBytes, d.d.UsedBytes, d.d.OpenVolumes, d.seen = b.CapacityBytes, b.UsedBytes, b.OpenVolumes, now
 	}
 	return c.meta, nil
+}
+
+func (c *Catalogue) Goodbye(ctx context.Context, node catalogue.NodeID, instance [16]byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nr := c.nodes[node]
+	if nr == nil {
+		return catalogue.ErrNodeNotFound
+	}
+	if nr.beatSeen != 0 && nr.beat.Instance == instance {
+		nr.beatSeen = 0
+	}
+	return nil
 }
 
 func (c *Catalogue) LiveNodes(ctx context.Context) ([]catalogue.NodeInfo, error) {

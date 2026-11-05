@@ -22,6 +22,8 @@ type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) Now() time.Time { return c.t }
 
+func (c *fakeClock) After(time.Duration) <-chan time.Time { return nil }
+
 func rnd() func() uint32 {
 	var n uint32
 	return func() uint32 { n += 0x9E3779B1; return n }

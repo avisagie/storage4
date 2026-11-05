@@ -346,10 +346,17 @@ type Cluster interface {
 	SetDiskState(ctx context.Context, id DiskID, s DiskState) error
 	// Heartbeat upserts the node's liveness and its disks' stats and returns
 	// the current Meta, so the node sees an incarnation or compat change on
-	// every beat. ErrNodeNotFound (nodes never self-register),
+	// every beat. ErrInvalidArgument if Version is not 1..128 bytes.
+	// ErrNodeNotFound (nodes never self-register),
 	// ErrNodeIDInUse if another instance beat within NodeTTL, ErrUnknownDisk
 	// for a disk that is not registered to this node.
 	Heartbeat(ctx context.Context, n NodeBeat, disks []DiskBeat) (Meta, error)
+	// Goodbye ends the instance's heartbeat on a clean shutdown, so a
+	// successor may take the node ID at once instead of waiting out NodeTTL.
+	// It only acts when instance is the one that last beat; a different or
+	// unknown instance, and a repeat, are no-ops. ErrNodeNotFound if the node
+	// has no ID.
+	Goodbye(ctx context.Context, node NodeID, instance [16]byte) error
 	// LiveNodes returns nodes whose last heartbeat is within NodeTTL, by ID.
 	LiveNodes(ctx context.Context) ([]NodeInfo, error)
 	// Disks returns every disk, ordered by ID.

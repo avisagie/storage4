@@ -35,7 +35,7 @@ The Go interface in `catalogue/catalogue.go` is the source of truth (every metho
 | `Leases` | `AcquireShard`, `RenewShard`, `ReleaseShard`, `ShardOwner` |
 | `Volumes` | `OpenVolume(lease, OpenParams)`, `BeginSeal`, `FinishSeal`, `GetVolume`, `ListShardVolumes` (newest volume number first), `ListDiskVolumes`, `SetReplicaState`, `AddReplica` |
 | `Erasures` | `AddErasures`, `ShardErasures`, `PendingErasures`, `MarkErasureApplied`, `ListErasures` (paged export) |
-| `Cluster` | `AssignNodeID`, `RegisterDisk`, `SetDiskState`, `Heartbeat`, `LiveNodes`, `Disks` |
+| `Cluster` | `AssignNodeID`, `RegisterDisk`, `SetDiskState`, `Heartbeat`, `Goodbye` (clean shutdown frees the node ID at once; added 2026-11-05), `LiveNodes`, `Disks` |
 
 Details settled while writing the contract suite (all enforced by `cattest`):
 - `OpenVolume` requires the volume ID's node part to equal the lease holder's node ID, distinct registered **active** disks, and `CipherID` equal to the bucket's. Refusals consume no volume number.
