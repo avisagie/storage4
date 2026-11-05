@@ -5,11 +5,12 @@ import (
 	"sync"
 	"time"
 
+	"storage4/clock"
 	"storage4/disk"
 )
 
 // Clock is the time source for idle closing; inject a fake in tests.
-type Clock interface{ Now() time.Time }
+type Clock = clock.Clock
 
 // pool is a bounded LRU of open files, refcounted so a file is never closed
 // under a reader. Files are opened on demand and closed when evicted or idle.

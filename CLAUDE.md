@@ -61,7 +61,8 @@ A task is done only when `make check` passes. Fast loop (L0–L1 + short simulat
 format/     pure encode/decode of on-disk structures
 names/      pure bucket/name validation, shard function
 disk/       FS interface: real, in-memory, fault-injecting
-catalogue/  Catalogue interface: PostgreSQL impl (production), SQLite impl (tests/dev only), in-memory fake
+clock/      Clock interface + Fake (real clock lives in cmd/)
+catalogue/  Catalogue interface; sqlcat/ = PostgreSQL (production) + SQLite (tests/dev only) over database/sql; mem/ = in-memory fake; cattest/ = contract suite
 volume/     single-writer append, group commit, seal, erase, .idx
 nameindex/  open-volume name map, .nidx build (in memory, write once) / read (positioned reads), file-handle LRU
 transport/  node-to-node RPC (forwarding, replica I/O): HTTP impl + in-memory

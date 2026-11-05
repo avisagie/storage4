@@ -1,6 +1,6 @@
 # Catalogue (`catalogue/`, `db/`)
 
-Status: design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). Nothing is implemented yet; the human gate on the final interface, migration 0001 and the lease/ordinal/epoch SQL stays open until the code is reviewed. Rationale: design-notes §6, §8, §13.
+Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat`, `catalogue/cattest`, `db/`); design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). The human gate on the interface, migration 0001 and the lease/ordinal/epoch SQL stays open until the code is reviewed. Rationale: design-notes §6, §8, §13.
 
 ## Scope
 
@@ -19,156 +19,27 @@ Status: design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times
 5. **A catalogue outage fails writes** (`ErrUnavailable`): no lease can be granted or renewed. Reads of cached data are the node's business.
 6. Errors are sentinels (`errors.Is`), listed below; every method returns `ctx` errors and database errors wrapped.
 
-## Interface sketch
+## Interface
 
-```go
-package catalogue
+The Go interface in `catalogue/catalogue.go` is the source of truth (every method is documented there); `catalogue/errors.go` lists the sentinel errors. Shape: `Catalogue` = `Buckets` + `Leases` + `Volumes` + `Erasures` + `Cluster` + `Meta` + `Close`.
 
-type NodeID uint16      // 1..65535, never reused; 0 invalid
-type DiskID [16]byte
-type VolumeID uint64    // node_id(16) | node-local counter(48); stored as 16 lower-case hex digits
+| Concern | Methods |
+|---|---|
+| `Buckets` | `CreateBucket` (idempotent; conflict on different S; deleted refuses), `GetBucket`, `DeleteBucket` (also clears the bucket's shard leases), `ListBuckets` |
+| `Leases` | `AcquireShard`, `RenewShard`, `ReleaseShard`, `ShardOwner` |
+| `Volumes` | `OpenVolume(lease, OpenParams)`, `BeginSeal`, `FinishSeal`, `GetVolume`, `ListShardVolumes` (newest ordinal first), `ListDiskVolumes`, `SetReplicaState`, `AddReplica` |
+| `Erasures` | `AddErasures`, `ShardErasures`, `PendingErasures`, `MarkErasureApplied`, `ListErasures` (paged export) |
+| `Cluster` | `AssignNodeID`, `RegisterDisk`, `SetDiskState`, `Heartbeat`, `LiveNodes`, `Disks` |
 
-type Meta struct {
-    ClusterID     [16]byte
-    ClusterName   string
-    SchemaVersion int
-    MinCompat     int
-    Incarnation   int64 // opaque; compared for equality; changed by the failover runbook
-}
+Details settled while writing the contract suite (all enforced by `cattest`):
+- `OpenVolume` requires the volume ID's node part to equal the lease holder's node ID, distinct registered **active** disks, and `CipherID` equal to the bucket's. Refusals consume no ordinal.
+- `AddReplica` only for **sealed** volumes and active disks; the new replica gets a pending erasure target for every erasure of the volume, because it was copied from a replica that may not have applied them yet. `AddErasures` creates targets only for non-lost replicas.
+- `FinishSeal` is a no-op when repeated with the same values, `ErrSealMismatch` with different ones, `ErrEpochMismatch` if another `BeginSeal` intervened.
+- `RenewShard` of an expired but untaken lease succeeds; of a superseded or cleared one, `ErrLeaseLost`.
+- `SetDiskState`: `gone` is terminal (`ErrDiskGone`). `Heartbeat` refuses unknown nodes (`ErrNodeNotFound`), a second live instance of a node ID (`ErrNodeIDInUse`) and disks not registered to that node.
+- Ordering contracts: `ListShardVolumes` by ordinal descending, `ListDiskVolumes` by volume ID, `Disks` by disk ID, erasure lists by (volume, seq).
 
-type Catalogue interface {
-    Buckets
-    Leases
-    Volumes
-    Erasures
-    Cluster
-    // Meta checks nothing itself: the node compares ClusterID with its local state,
-    // SchemaVersion with its requires_schema and MinCompat with its compat_level.
-    Meta(ctx context.Context) (Meta, error) // ErrNotInitialised on an empty database
-    Close() error
-}
-
-// ---- buckets ----
-type BucketState string // "active", "deleted", "restored"
-type Bucket struct {
-    Name      string
-    Shards    int // S, fixed for life
-    State     BucketState
-    CipherID  uint16 // 0 in the MVP
-    CreatedAt time.Time
-    DeletedAt time.Time // zero unless deleted
-}
-type Buckets interface {
-    // Idempotent. Same options: created=false. Different Shards: ErrBucketConflict.
-    // A deleted bucket: ErrBucketDeleted (never accepts writes again).
-    CreateBucket(ctx context.Context, name string, shards int) (b Bucket, created bool, err error)
-    GetBucket(ctx context.Context, name string) (Bucket, error) // ErrBucketNotFound
-    // Marks deleted (volumes are removed later by pull-based GC). Idempotent for an
-    // existing bucket; ErrBucketNotFound for a name that never existed.
-    DeleteBucket(ctx context.Context, name string) error
-    ListBuckets(ctx context.Context) ([]Bucket, error) // all states, for reconcile/GC/scan
-}
-
-// ---- shard leases ----
-// Lease is the fencing token. Treat as opaque; pass back unchanged.
-type Lease struct {
-    Bucket     string
-    Shard      int
-    Node       NodeID
-    Generation int64         // strictly increases on every grant for this shard
-    TTL        time.Duration // as granted; the node renews at TTL/3
-}
-type Leases interface {
-    // Grants the lease if the shard is free, expired, or already held by the same node
-    // (a restarted owner re-acquires at once). Generation increases on every grant.
-    // Held by another node and unexpired: *ErrLeaseHeld (with the holder, for "not owner, try X").
-    AcquireShard(ctx context.Context, bucket string, shard int, node NodeID, ttl time.Duration) (Lease, error)
-    // Extends expiry. ErrLeaseLost if the generation is no longer current (someone else
-    // took over, or the bucket is gone). Renewing an expired but untaken lease succeeds.
-    RenewShard(ctx context.Context, l Lease) error
-    // Clears the holder; keeps the row and counters. Idempotent; a stale lease is a no-op.
-    ReleaseShard(ctx context.Context, l Lease) error
-    // Current holder, for forwarding. ok=false: nobody holds an unexpired lease.
-    ShardOwner(ctx context.Context, bucket string, shard int) (o Owner, ok bool, err error)
-}
-type Owner struct { Node NodeID; Generation int64; Expires time.Time }
-
-// ---- volumes ----
-type VolumeState string // "open", "sealing", "sealed"
-type ReplicaState string // "ok", "failed", "lost"
-type Replica struct { Disk DiskID; State ReplicaState }
-type Volume struct {
-    ID                     VolumeID
-    Bucket                 string
-    Shard                  int
-    Ordinal                int64 // per (bucket, shard); latest version = highest (ordinal, seq)
-    State                  VolumeState
-    Epoch                  uint32 // 1 at creation, +1 per BeginSeal
-    FormatMajor, FormatMinor uint16
-    CipherID, Tier         uint16
-    CommittedLength        int64  // valid when sealed
-    RecordCount            uint32 // valid when sealed (seal record's count)
-    CreatedAt, SealedAt    time.Time
-    Replicas               []Replica
-}
-type Volumes interface {
-    // One transaction, under the lease: assigns the next ordinal of the shard, inserts the
-    // volume (state open, epoch 1) and its replica rows. ErrLeaseLost, ErrVolumeExists.
-    OpenVolume(ctx context.Context, l Lease, id VolumeID, disks []DiskID, tier uint16) (Volume, error)
-    // Fences the old writer: bumps the epoch, state "sealing", returns the new epoch.
-    // Call before telling replicas to seal. Repeatable (each call bumps again). Under the lease;
-    // the volume must belong to the lease's shard. Sealed volume: ErrVolumeSealed.
-    BeginSeal(ctx context.Context, l Lease, id VolumeID) (epoch uint32, err error)
-    // Records the outcome once replicas sealed at `committed`. Needs epoch == current
-    // (ErrEpochMismatch if someone bumped since). Same values again: no-op. Other values: ErrSealMismatch.
-    FinishSeal(ctx context.Context, l Lease, id VolumeID, epoch uint32, committed int64, records uint32) error
-    GetVolume(ctx context.Context, id VolumeID) (Volume, error) // ErrVolumeNotFound
-    // All volumes of a shard, newest ordinal first (lookup order). Includes open/sealing ones.
-    ListShardVolumes(ctx context.Context, bucket string, shard int) ([]Volume, error)
-    // Volumes with a replica on the disk, any bucket state (reconcile, GC, scan verify).
-    ListDiskVolumes(ctx context.Context, disk DiskID) ([]Volume, error)
-    // Not lease-gated: the owner (seal-on-failure) and admin (repair) both use them.
-    SetReplicaState(ctx context.Context, id VolumeID, disk DiskID, s ReplicaState) error
-    AddReplica(ctx context.Context, id VolumeID, disk DiskID) error // re-replication finished
-}
-
-// ---- erasure list ----
-type Locator struct { Volume VolumeID; Seq, Check uint32 }
-type Erasures interface {
-    // Under the lease; every locator's volume must belong to the lease's shard.
-    // Inserts the locators and one pending target per replica of each volume. Idempotent.
-    AddErasures(ctx context.Context, l Lease, locs []Locator) error
-    ShardErasures(ctx context.Context, bucket string, shard int) ([]Locator, error) // owner cache
-    PendingErasures(ctx context.Context, disk DiskID, limit int) ([]Locator, error)
-    MarkErasureApplied(ctx context.Context, disk DiskID, locs []Locator) error
-    ListErasures(ctx context.Context, after Locator, limit int) ([]Locator, error) // export, ordered
-}
-
-// ---- nodes and disks ----
-type DiskState string // "active", "readonly", "gone"; "down" is derived from a stale heartbeat
-type NodeBeat struct { ID NodeID; Instance [16]byte; Addr, Version string; Compat int }
-type DiskBeat struct { ID DiskID; CapacityBytes, UsedBytes int64; OpenVolumes int }
-type NodeInfo struct { ID NodeID; Name, Addr, Version string; Compat int; LastSeen time.Time }
-type Disk struct {
-    ID DiskID; Node NodeID; State DiskState
-    CapacityBytes, UsedBytes int64; OpenVolumes int; LastSeen time.Time
-}
-type Cluster interface {
-    // Admin: idempotent per name; never reuses an ID.
-    AssignNodeID(ctx context.Context, name string) (NodeID, error)
-    // Admin: add a disk. Idempotent for the same (disk, node); a disk on another node: ErrDiskConflict.
-    RegisterDisk(ctx context.Context, id DiskID, node NodeID) error
-    SetDiskState(ctx context.Context, id DiskID, s DiskState) error
-    // Node: upserts the node row and its disks' stats; returns current Meta so the node sees an
-    // incarnation or compat change on every beat. ErrNodeIDInUse if another instance beat within NodeTTL.
-    // ErrUnknownDisk for a disk that was not registered (nodes never auto-register).
-    Heartbeat(ctx context.Context, n NodeBeat, disks []DiskBeat) (Meta, error)
-    LiveNodes(ctx context.Context) ([]NodeInfo, error) // beat within NodeTTL; rendezvous candidates
-    Disks(ctx context.Context) ([]Disk, error)         // placement inputs
-}
-```
-
-Errors: `ErrNotInitialised`, `ErrUnavailable`, `ErrBucketNotFound`, `ErrBucketConflict`, `ErrBucketDeleted`, `*ErrLeaseHeld{Node, Expires}`, `ErrLeaseLost`, `ErrVolumeNotFound`, `ErrVolumeExists`, `ErrVolumeSealed`, `ErrEpochMismatch`, `ErrSealMismatch`, `ErrDiskConflict`, `ErrUnknownDisk`, `ErrNodeIDInUse`.
+Errors: `ErrNotInitialised`, `ErrUnavailable`, `ErrInvalidArgument`, `ErrBucketNotFound`, `ErrBucketConflict`, `ErrBucketDeleted`, `ErrLeaseHeld` (as `*HeldError{Node, Expires}`), `ErrLeaseLost`, `ErrVolumeNotFound`, `ErrVolumeExists`, `ErrVolumeSealed`, `ErrVolumeNotSealed`, `ErrEpochMismatch`, `ErrSealMismatch`, `ErrReplicaNotFound`, `ErrErasureNotFound`, `ErrNodeNotFound`, `ErrNodeIDInUse`, `ErrNodeIDsExhausted`, `ErrUnknownDisk`, `ErrDiskConflict`, `ErrDiskUnavailable`, `ErrDiskGone`.
 
 ## Seal and handover sequence (what the interface is shaped for)
 
