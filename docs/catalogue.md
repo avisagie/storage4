@@ -1,6 +1,6 @@
 # Catalogue (`catalogue/`, `db/`)
 
-Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat`, `catalogue/cattest`, `db/`); design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). Migration 0001 approved 2026-11-05 (frozen); the human gate on the interface and the lease/ordinal/epoch SQL stays open until the code is reviewed. Rationale: design-notes §6, §8, §13.
+Status: implemented 2026-11-05 (`catalogue/`, `catalogue/mem`, `catalogue/sqlcat`, `catalogue/cattest`, `db/`); design decisions 1–8 below confirmed by the reviewer 2026-11-05 (times in milliseconds, not microseconds). Approved 2026-11-05 (human gate): interface, migration 0001 (frozen) and the lease/ordinal/epoch SQL. Rationale: design-notes §6, §8, §13.
 
 ## Scope
 
