@@ -77,11 +77,12 @@ cmd/store/  flags, signals, calls node.Start — wiring only
 |---|---|---|
 | L0 pure | format, names, shard function, CRC, nonce construction, `.nidx` table encode/decode | table tests, round-trip, `go test -fuzz`, golden files |
 | L1 component | volume writer, erasure, `.idx`, `.nidx`, restart recovery | in-memory / fault-injecting FS (short write, fsync error, ENOSPC, torn write, crash-at-any-write); corrupted/wrong-version index files; fingerprint collisions |
-| L2 catalogue | SQL, shard/volume leases, ordinals, epochs, migrations | PostgreSQL via testcontainers-go; migrations empty→latest, snapshot→latest, run twice |
+| L2 catalogue | SQL, shard/volume leases, ordinals, epochs, migrations | PostgreSQL, either local (`STORAGE4_TEST_PG_DSN`) or testcontainers-go — both are first class and run the same suite; migrations empty→latest, snapshot→latest, run twice |
 | Contract | fake vs real catalogue | one suite run against both; extend it whenever the `Catalogue` interface changes |
 | L3 simulation | anything involving more than one node (forwarding, handover, replication) | `sim/`: seeded scheduler, virtual clock, fault events, invariant checks every step |
 | L4 e2e | real binaries, nightly | Docker Compose, `kill -9`, disk full, PG failover, shard handover, `scan rebuild` |
 
+- L2 and contract tests need a PostgreSQL. Start a throwaway local one with `make pg-start` (`scripts/pg-start.sh`; no root, trust auth, localhost, fsync off, data in `~/pgdata`) and stop it with `make pg-stop` (`scripts/pg-stop.sh`, `--purge` deletes the data). The script prints the `STORAGE4_TEST_PG_DSN` to export. This is the default for agent sessions: they already run inside a container, so testcontainers (Docker-in-container) is generally unavailable there. L2 tests use the DSN when set and testcontainers otherwise (CI, developer machines). You may start and stop the local one yourself; never point tests at any other database.
 - A failing simulation seed becomes a named regression test with that seed.
 - New fault type in production code paths → add a matching fault event to `sim/`.
 - Never fix a failing test by loosening its assertion; if the test is wrong, say so and stop for review.
