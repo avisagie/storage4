@@ -1,6 +1,6 @@
 # Volume layer (`volume/`)
 
-Status: draft for review (seal and seq logic are a human gate). `volume/` manages **one replica of one volume file on one disk**. Replication, epochs, leases and the choice of committed length belong to `node/`. Byte layout: `docs/format-v1.md`; durability and recovery rule: `docs/disk.md`.
+Status: seal and seq logic approved 2026-11-05. `volume/` manages **one replica of one volume file on one disk**. Replication, epochs, leases and the choice of committed length belong to `node/`. Byte layout: `docs/format-v1.md`; durability and recovery rule: `docs/disk.md`.
 
 ## API
 
@@ -21,7 +21,7 @@ Status: draft for review (seal and seq logic are a human gate). `volume/` manage
 - Any I/O error (write or sync) disables the writer for good (`ErrFailed`); it never retries and never reuses a seq. `Committed()` still names the last acknowledged length.
 - Validation errors (`ErrInvalidEntry`) and `ErrFull` are detected before any seq is consumed, so they leave the writer usable.
 - Seqs are strictly increasing in file order, so the valid prefix also ends where a seq does not increase.
-- **The seal's seq is the prefix's last seq + 1, which may equal the seq of a discarded unacknowledged record.** This is deliberate. The seal record is never encrypted (no tag, no nonce), and nothing is ever appended to a sealed volume, so no AES-GCM nonce (volume ID ‖ seq) can repeat. Reviewer: please confirm this reading of the invariant.
+- **The seal's seq is the prefix's last seq + 1, which may equal the seq of a discarded unacknowledged record.** This is deliberate. The seal record is never encrypted (no tag, no nonce), and nothing is ever appended to a sealed volume, so no AES-GCM nonce (volume ID ‖ seq) can repeat.
 
 ## Seal logic
 
