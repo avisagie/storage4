@@ -409,7 +409,7 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 **Mechanism:**
 1. The shard owner looks up every version of the name (all of the shard's volumes) and inserts their locators into the catalogue's **erasure list** → reads return `410` immediately (the owner caches the list). The list is permanent and exported with the deletion log.
 2. Volumes still open are sealed first (keeps erasure off the append path).
-3. Each replica holder, idempotently: overwrite the record's name, sha256, metadata and payload bytes with **zeros**, set `type = erased-file`, rewrite the header CRC, fsync. Record lengths unchanged → every later record keeps its offset; `.idx` unchanged.
+3. Each replica holder, idempotently: verify the record header; in one contiguous write set `type = erased-file`, zero region A (name, sha256, metadata) and rewrite the header CRC; then zero the payload in chunks; fsync. (Head first, so the record is valid at every later step — format-v1 §7.) The erase RPC carries (volume, offset, seq, check, name), never the zeros. Record lengths unchanged → every later record keeps its offset; `.idx` unchanged.
 4. Zero the record's entry in the seal-footer metadata copy, if present. `.nidx` files are immutable: lookups filter erased versions through the erasure list; scrub/rebuild produce index files without them.
 5. The catalogue tracks which replicas have applied it; offline disks apply pending erasures on reconcile; scan/rebuild re-applies the list.
 6. A later `PUT` of the same name stores a new version normally.
