@@ -35,9 +35,13 @@ func (w *Writer) Seal(epoch uint32) (format.Seal, error) {
 	if err := w.f.Sync(); err != nil {
 		return format.Seal{}, w.fail(err)
 	}
+	w.setIdx(w.nextSeq-1, w.committed, uint32(len(rec)))
 	w.committed += int64(len(rec))
 	w.sealed = true
-	return s, w.f.Close()
+	w.hasSeal = true
+	f := w.f
+	w.f = nil
+	return s, f.Close()
 }
 
 // Close releases the file without sealing. The volume stays open on disk;

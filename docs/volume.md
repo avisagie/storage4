@@ -1,6 +1,6 @@
 # Volume layer (`volume/`)
 
-Status: draft for review (seal and seq logic are a human gate). `volume/` manages **one replica of one volume file on one disk**. Replication, epochs, leases and the choice of committed length belong to `node/`. Byte layout: `docs/format-v1.md`; durability and recovery rule: `docs/disk.md`. The `.idx` seq index is not implemented yet (next step).
+Status: draft for review (seal and seq logic are a human gate). `volume/` manages **one replica of one volume file on one disk**. Replication, epochs, leases and the choice of committed length belong to `node/`. Byte layout: `docs/format-v1.md`; durability and recovery rule: `docs/disk.md`.
 
 ## API
 
@@ -12,6 +12,7 @@ Status: draft for review (seal and seq logic are a human gate). `volume/` manage
 | `SealFile(fsys, path, committed, epoch, rnd)` | Seal a replica without a (working) writer: restart, handover, replica failure. |
 | `Scan(file, fn)` | Streaming scan of the longest valid prefix; calls `fn` per record; payloads are CRC-checked in 1 MiB chunks. |
 | `ReadHead` / `Head.Payload` / `Head.ReadAll` | Header-verifying read. |
+| `Writer.Idx()`, `WriteIdx`, `BuildIdx`, `RebuildIdx`, `EnsureIdx`, `DecodeIdx` | Seq index of a sealed volume (below). |
 | `Erase(file, items)` | In-place erasure per format-v1 §7, one fsync per batch. |
 
 ## Seq logic
@@ -37,6 +38,27 @@ Status: draft for review (seal and seq logic are a human gate). `volume/` manage
 
 Verify first (header CRC, seq, check, length, name), then write the erased head in one contiguous write, then zeros over region B, then one fsync for the batch. A record whose head write was torn by a crash (or that is already erased) is finished from the 24-byte header and the locator alone, without a name check. Meant for sealed volumes: on an open volume a crash inside the head write can end the valid prefix there.
 
+## Seq index (`<volume-id>.idx`)
+
+A rebuildable cache for **sealed** volumes only: seq to (offset, record length). It is not part of the permanent format; it carries its own version. Open volumes have no `.idx`: their map lives in memory, and after a restart the owner's mandatory full pass over each open volume (design-notes §7, restart rule 1) seals it and writes the index, so a separate "tail scan" would save nothing and is not implemented (decided 2026-11-05).
+
+```
+ offset  size
+ 0       8   magic          89 53 34 49 44 58 0D 0A
+ 8       2   version        1
+ 10      2   reserved       0
+ 12      4   header_len     32
+ 16      8   volume_id
+ 24      4   slots          entries; = highest seq in the volume (the seal's)
+ 28      4   header_CRC     CRC-32C over bytes [0, 28)
+ 32      8*slots entries    entry for seq s is slot s-1: offset/8 (u32) | record length (u32); all zero = no record with that seq
+ ...     16  footer         "S4IF" | present (u32) | entries_CRC (u32, CRC-32C over all entries) | reserved 0
+```
+
+All integers little-endian. The file size must be exactly `32 + 8*slots + 16`; the decoder accepts nothing else (strict: every byte flip and truncation is rejected). Written atomically (tmp, fsync, rename, `SyncDir`). Index files never contain names or hashes.
+
+`EnsureIdx` uses an existing file only if it decodes, names the right volume, and agrees with the volume's end (its highest entry is the seal record and ends exactly at the file's end). Anything else (missing, corrupt, other volume, stale) is rebuilt by a full pass and rewritten; never an error. Even a used entry is only a locator: `ReadHead` verifies the record. `Writer.Idx()` builds the index from the locators the writer handed out, so sealing needs no re-read; writing it is the caller's step and its failure does not fail the seal.
+
 ## Tests (L1, `disk.Mem` + `disk.Faulty`)
 
-Crash sweeps (crash before/after every operation, all four crash modes) over: append batches (every acknowledged record is in the prefix with its locator; the volume can then be sealed at the acknowledged length), `SealFile`, and erasure (retry completes; other records intact). Plus: one sync per batch, failed append then `SealFile`, refusals that consume no seq, stop at first invalid record, non-increasing seq, locator verification, streaming CRC failure.
+Crash sweeps (crash before/after every operation, all four crash modes) over: append batches (every acknowledged record is in the prefix with its locator; the volume can then be sealed at the acknowledged length), `SealFile`, and erasure (retry completes; other records intact). Index: round trip, writer index equals rebuilt index, every byte flip/truncation rejected, fuzz, stale/foreign/corrupt index rebuilt, crash sweep of `WriteIdx`. Plus: one sync per batch, failed append then `SealFile`, refusals that consume no seq, stop at first invalid record, non-increasing seq, locator verification, streaming CRC failure.

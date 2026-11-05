@@ -44,11 +44,13 @@ type Writer struct {
 	hdr       format.VolumeHeader
 	maxSize   int64
 	rnd       func() uint32
-	committed int64  // end of the last record made durable by a successful Sync
-	nextSeq   uint32 // next seq to hand out; 0 means exhausted
-	records   uint32 // file and erased-file records committed
+	committed int64      // end of the last record made durable by a successful Sync
+	nextSeq   uint32     // next seq to hand out; 0 means exhausted
+	records   uint32     // file and erased-file records committed
+	idx       []IdxEntry // by seq-1; only durable records
 	err       error
 	sealed    bool
+	hasSeal   bool // sealed by Seal (not merely closed)
 }
 
 // Create makes a new volume file for h on fsys and returns its Writer. The
@@ -200,6 +202,9 @@ func (w *Writer) Append(entries []Entry) ([]Locator, error) {
 	}
 	w.committed = off
 	w.records += uint32(len(entries))
+	for _, l := range locs {
+		w.setIdx(l.Seq, l.Off, l.Len)
+	}
 	return locs, nil
 }
 
@@ -207,3 +212,20 @@ const (
 	smallPayload = 64 << 10
 	sealReserve  = 64
 )
+
+func (w *Writer) setIdx(seq uint32, off int64, n uint32) {
+	for uint32(len(w.idx)) < seq {
+		w.idx = append(w.idx, IdxEntry{})
+	}
+	w.idx[seq-1] = IdxEntry{Off: off, Len: n}
+}
+
+// Idx returns the seq index of a sealed writer's volume, built from the
+// locators it handed out (no re-read). Write it with WriteIdx; it is a cache,
+// so a failure to write it is not a failure to seal.
+func (w *Writer) Idx() (*Idx, error) {
+	if !w.hasSeal {
+		return nil, ErrNotSealed
+	}
+	return &Idx{VolumeID: w.hdr.VolumeID, Entries: w.idx}, nil
+}
