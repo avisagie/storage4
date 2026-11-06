@@ -50,7 +50,7 @@ Deviation from design-notes §15: `FS` is `Disks []disk.FS` because a node manag
 
 - At `Start` each disk's identity file is read (`disk.ReadIdentity`); cluster ID must match the catalogue; disks missing from the catalogue are registered; a disk whose catalogue state is `gone`, `readonly` or unhealthy takes no new volumes. A disk that fails to read its identity is excluded and an alarm is raised; fewer than 3 usable disks means writes return `503` (replication factor is 3, no degraded mode).
 - Node ID: `AssignNodeID(NodeName)`.
-- **Volume ID counter** (48 bit, never goes back): a small file `node-counter` is written atomically (`WriteFileAtomic`) to **every** disk; the value is the highest ID block reserved. Blocks of 256 are reserved by writing `max over readable disks + 256` to all disks before use. Startup takes the maximum over all readable disks. It is lost only if all disks lose it (then the node must get a new node ID: operator action, documented). *Review: confirm this instead of "first disk only".*
+- **Volume ID counter** (48 bit, never goes back): a small file `node-counter` is written atomically (`WriteFileAtomic`) to every disk, **best effort**; the value is the highest ID block reserved. Blocks of 256 are reserved by writing `max over readable disks + 256`; the reserve is usable once it is on at least one disk, and only a write failing on every disk refuses an ID (`503`). Startup takes the maximum over all readable disks and the catalogue's highest volume ID for this node, so an ID handed out but never registered (no file exists for it) may be reused harmlessly (decided 2026-11-06). It is lost only if all disks lose it (then the node must get a new node ID: operator action, documented). 
 
 ## 4. Replica seam
 
@@ -149,11 +149,11 @@ Per open volume: one committer. Per node: one maintenance loop (lease renewals, 
 Where the code settled details this document left open:
 
 - **Replicas are byte-identical.** Each replica's `volume.Writer` draws record `check` values from its own PCG, all seeded identically per volume from the node's random source, so every replica gets the same check and one locator serves all three. `commit` verifies that the replicas return equal locators.
-- **Registration order.** `OpenVolume` (catalogue) runs before the replica files are created, because the header needs the volume number the catalogue assigns. A crash in between leaves a registered volume with no files; recovery marks the replicas lost and finishes the seal with length 0. Lookups skip a volume with no usable replica.
+- **Registration order.** `OpenVolume` (catalogue) runs before the replica files are created, because the header needs the volume number the catalogue assigns. A crash in between leaves a registered volume with no files; recovery marks the replicas lost and finishes the seal with length 0. A sealed volume with zero records is skipped by lookups; one with records but no usable replica is *unreadable* (see GET below).
 - **Suspect disks.** A replica that fails an append marks its disk suspect for 10 minutes (injected clock): no new volume is placed there. Operators decide "gone"; the catalogue's replica state `failed` records the replica.
 - **Bucket cache.** Bucket state is cached for 5 s (injected clock). `DELETE /b/{bucket}` clears this node's cache and abandons the bucket's open volumes at once (writers closed, no seal: the catalogue cleared the leases; pull-based GC removes the files).
 - **Idle and lease ticks.** One maintenance goroutine ticks every TTL/3: renews leases that are due, seals idle volumes, releases the lease of a shard with no open volume, closes idle index handles, refreshes disk states and heartbeats. A changed catalogue incarnation abandons all leases and raises `shard-lease-lost`.
-- **GET.** The first 64 KiB are read and CRC-verified before headers go out, so small files are fully verified before the first byte. Larger payloads stream and abort the connection on a CRC failure (decided 2026-11-05). `docs/api.md` §2.2 says a corrupt replica is skipped in favour of another; the node does not do that yet (lookup uses the first replica that serves the record). Open item.
+- **GET.** The first 64 KiB are read and CRC-verified before headers go out, so small files are fully verified before the first byte. Larger payloads stream with a one-chunk lag: a chunk is sent only after the read that follows it succeeded, so the last chunk leaves only after the payload CRC verified and an abort leaves the client with a short body it can detect (an abort after the full `Content-Length` was written would look like success; fixed 2026-11-06). The record is released even when the transfer aborts. `docs/api.md` §2.2 says a corrupt replica is skipped in favour of another; the node does not do that yet (lookup uses the first replica that serves the record). Open item.
 - **`Config.AllowSmallVolumes`** exists for tests only.
 - **Tests run on three catalogues**: `catalogue/mem`, SQLite and PostgreSQL (`db/dbtest.Catalogue`, shared with the contract suite). The PostgreSQL runs skip without `STORAGE4_TEST_PG_DSN`.
 
@@ -172,3 +172,14 @@ Still open:
 ## Future: disk management
 
 Today a failed append suspects the disk for 10 minutes (no new volumes there) and the replica is marked `failed`. Intended later, not built: a disk that fails an append or a verified read goes read-only in the catalogue automatically and raises an alarm to the operator; recovery and "gone" stay manual commands (design-notes §6, failure policy).
+
+## Unreadable volumes (decided 2026-11-06)
+
+Write availability comes first and reads tolerate errors, but an older version never stands in for the latest. If the newest volume that may hold a name has no replica any lookup can use (all failed, lost or unreadable), the lookup is *uncertain* and the node raises `replica-unavailable` (critical) and goes on:
+
+- `GET`, `HEAD`, `GET /m/`: `503` + `Retry-After` for names the volume may hold (any name not found in a newer volume).
+- `PUT` without conditions: proceeds and stores a new version (dedup is skipped; a new version is always the highest).
+- `PUT` with `If-Match` / `If-None-Match`: `503` (the condition cannot be judged).
+- Names found in the open volume or a newer sealed volume answer normally.
+
+Recovery is operator-level (milestone 8: repair from another replica, or declare the volume lost). Corrupt copies found by a GET are excluded per (disk, volume), not per disk.

@@ -165,7 +165,8 @@ func (n *Node) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, catalogue.ErrUnavailable), errors.Is(err, catalogue.ErrLeaseHeld),
 		errors.Is(err, catalogue.ErrLeaseLost), errors.Is(err, errNoReplicaSet),
 		errors.Is(err, errLeaseUnavailable), errors.Is(err, errTooManyOpen),
-		errors.Is(err, errRetriesExhausted), errors.Is(err, context.Canceled):
+		errors.Is(err, errRetriesExhausted), errors.Is(err, errLookupUncertain),
+		errors.Is(err, errCounterUnavailable), errors.Is(err, context.Canceled):
 		retryLater(w, http.StatusServiceUnavailable, "unavailable")
 	default:
 		n.d.Logger.Error("request failed", "err", err.Error())
@@ -439,7 +440,7 @@ func parseContentDigest(v string) (*[32]byte, error) {
 // ---- GET, HEAD, metadata ----
 
 // lookupName finds the latest version of a name on its shard.
-func (n *Node) lookupName(ctx context.Context, bucket, name string, excl map[*localDisk]bool) (*found, error) {
+func (n *Node) lookupName(ctx context.Context, bucket, name string, excl exclusions) (*found, error) {
 	b, err := n.bucket(ctx, bucket, false)
 	if err != nil {
 		return nil, err
@@ -451,33 +452,37 @@ func (n *Node) lookupName(ctx context.Context, bucket, name string, excl map[*lo
 	if err != nil {
 		return nil, err
 	}
-	return n.shardOf(b, int(idx)).lookupExcluding(ctx, name, excl)
+	f, uncertain, err := n.shardOf(b, int(idx)).lookupExcluding(ctx, name, excl)
+	if uncertain {
+		return nil, errLookupUncertain
+	}
+	return f, err
 }
 
 func (n *Node) handleGet(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, name string) {
-	excl := map[*localDisk]bool{}
+	excl := exclusions{}
 	for {
 		f, err := n.lookupName(ctx, bucket, name, excl)
 		if err != nil {
-			if len(excl) > 0 && errors.Is(err, errNoSuchName) {
-				// Every replica that holds the record returned a corrupt copy.
-				n.d.Logger.Error("no intact replica of a record")
-				plain(w, http.StatusInternalServerError, "internal error")
-				return
-			}
 			n.fail(w, err)
 			return
 		}
-		done, bad := n.serveGet(w, r, f)
-		f.release()
+		done, bad := n.serveGetReleasing(w, r, f)
 		if done {
 			return
 		}
 		// The copy failed verification before any byte was sent: try another
 		// replica (docs/api.md §2.2).
 		n.d.Alarms.Raise(AlarmReplicaUnavailable, Warning, "a replica returned a corrupt record")
-		excl[bad] = true
+		excl[exclKey{bad, f.vol}] = true
 	}
+}
+
+// serveGetReleasing is serveGet that releases the record even when the
+// transfer aborts by panicking with http.ErrAbortHandler.
+func (n *Node) serveGetReleasing(w http.ResponseWriter, r *http.Request, f *found) (bool, *localDisk) {
+	defer f.release()
+	return n.serveGet(w, r, f)
 }
 
 // serveGet sends the record. done is false if the payload failed verification
@@ -500,11 +505,14 @@ func (n *Node) serveGet(w http.ResponseWriter, r *http.Request, f *found) (done 
 		return true, nil
 	}
 	body := h.Payload()
-	// Read the first chunk before sending headers: a small file is verified
-	// completely (including its payload CRC) before the first byte leaves.
-	buf := make([]byte, 64<<10)
-	k, err := io.ReadFull(body, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	// The payload CRC is only known after the last byte is read. Every chunk
+	// is therefore sent only after the read that follows it has succeeded, so
+	// the final chunk leaves after the CRC verified; aborting before it is
+	// sent leaves the client with a short body it can detect. A small file
+	// (one chunk) is verified completely before the first byte leaves.
+	cur, nxt := make([]byte, 64<<10), make([]byte, 64<<10)
+	k, err := io.ReadFull(body, cur)
+	if !readOK(err) {
 		if errors.Is(err, format.ErrCorrupt) {
 			return false, f.disk
 		}
@@ -514,20 +522,27 @@ func (n *Node) serveGet(w http.ResponseWriter, r *http.Request, f *found) (done 
 	}
 	n.cnt.gets.Add(1)
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(buf[:k]); err != nil {
-		return true, nil
-	}
-	n.cnt.bytesOut.Add(uint64(k))
-	if err == nil {
-		c, err := io.Copy(w, body)
-		n.cnt.bytesOut.Add(uint64(c))
-		if err != nil {
-			// Bytes are already on the wire: abort the connection so the
-			// client sees a failed transfer, never a silently corrupt file.
-			panic(http.ErrAbortHandler)
+	for err == nil { // cur is a full chunk; more may follow
+		k2, err2 := io.ReadFull(body, nxt)
+		if !readOK(err2) {
+			panic(http.ErrAbortHandler) // cur is unsent: the body stays short
 		}
+		if _, werr := w.Write(cur[:k]); werr != nil {
+			return true, nil
+		}
+		n.cnt.bytesOut.Add(uint64(k))
+		cur, nxt, k, err = nxt, cur, k2, err2
+	}
+	if _, werr := w.Write(cur[:k]); werr == nil {
+		n.cnt.bytesOut.Add(uint64(k))
 	}
 	return true, nil
+}
+
+// readOK reports whether an io.ReadFull result is a clean read: a full
+// buffer, or the verified end of the payload.
+func readOK(err error) bool {
+	return err == nil || err == io.ErrUnexpectedEOF || err == io.EOF
 }
 
 func (n *Node) handleMeta(ctx context.Context, w http.ResponseWriter, bucket, name string) {

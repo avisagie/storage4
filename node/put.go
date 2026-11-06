@@ -46,10 +46,16 @@ func (n *Node) put(ctx context.Context, b catalogue.Bucket, name string, r putRe
 	if err := sh.leaseOnly(ctx); err != nil {
 		return false, err
 	}
-	f, err := sh.lookup(ctx, name)
-	exists := err == nil
+	f, uncertain, err := sh.lookup(ctx, name)
+	exists := err == nil && !uncertain
 	switch {
 	case err == nil:
+		if uncertain && (r.ifNoneMatchA || r.ifMatch != "" || r.ifMatchAny) {
+			// A condition cannot be judged against an unreadable volume.
+			return false, errLookupUncertain
+		}
+		// Unconditional: skip dedup and store a new version, which is
+		// always the highest. Write availability over a saved duplicate.
 	case errors.Is(err, errNoSuchName), errors.Is(err, errNameErased):
 		// Erased names store a new version normally (api.md §2.4).
 	default:

@@ -19,6 +19,9 @@ import (
 // node may have handed out (docs/node.md §3).
 const counterFile = "node-counter"
 
+// errCounterUnavailable: the counter reserve could not be written to any disk (503).
+var errCounterUnavailable = errors.New("node: volume ID counter not writable on any disk")
+
 // counterBlock is how many IDs are reserved per write of the counter files.
 const counterBlock = 256
 
@@ -137,10 +140,13 @@ func (c *idCounter) allocate() (catalogue.VolumeID, error) {
 			}
 			wrote++
 		}
-		// Every usable disk must hold the new reserve; otherwise a later
-		// start could read an older maximum from the disk that failed.
-		if firstErr != nil || wrote != len(c.disks) {
-			return 0, fmt.Errorf("node counter: reserve not durable on all disks: %w", firstErr)
+		// Best effort: one disk holding the new reserve is enough. A start
+		// reads the maximum over the disks it can read and the catalogue's
+		// highest volume ID for this node covers the rest; an ID that was
+		// handed out but never registered names no file, so reusing it is
+		// harmless. Only failing everywhere refuses the ID.
+		if wrote == 0 {
+			return 0, fmt.Errorf("%w: %w", errCounterUnavailable, firstErr)
 		}
 		c.reserved = want
 	}

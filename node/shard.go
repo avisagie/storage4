@@ -25,7 +25,21 @@ var (
 	errNoReplicaSet = errors.New("node: no healthy replica set")
 	// errLeaseUnavailable: the shard lease cannot be held (503).
 	errLeaseUnavailable = errors.New("node: shard lease unavailable")
+	// errLookupUncertain: a volume that may hold a newer version of the name
+	// cannot be read, so no older version may answer (503).
+	errLookupUncertain = errors.New("node: lookup uncertain, a volume is unreadable")
+	// errNoIntactReplica: the record exists but every replica is corrupt (500).
+	errNoIntactReplica = errors.New("node: no intact replica of a record")
 )
+
+// exclKey names one replica of one volume. A GET that found a corrupt copy
+// excludes only that copy, never the disk's other volumes.
+type exclKey struct {
+	d   *localDisk
+	vol catalogue.VolumeID
+}
+
+type exclusions map[exclKey]bool
 
 type shardKey struct {
 	bucket string
@@ -339,6 +353,7 @@ func ensureIdx(fsys disk.FS, bucket string, id uint64) (*volume.Idx, bool, error
 // caller must call release.
 type found struct {
 	disk        *localDisk // the replica that served the record
+	vol         catalogue.VolumeID
 	head        *volume.Head
 	release     func()
 	volumeNum   int64
@@ -347,17 +362,22 @@ type found struct {
 
 // lookup finds the latest version of name: the open volume first, then the
 // sealed volumes newest first (docs/node.md §5). The first verified hit wins.
-func (sh *shard) lookup(ctx context.Context, name string) (*found, error) {
+//
+// uncertain means a volume that may hold a newer version could not be read by
+// any replica: the result is then (nil, true, nil), because an older version
+// must never stand in for the latest. Readers turn that into 503; an
+// unconditional write goes on (a new version is always the highest).
+func (sh *shard) lookup(ctx context.Context, name string) (f *found, uncertain bool, err error) {
 	return sh.lookupExcluding(ctx, name, nil)
 }
 
-// lookupExcluding is lookup that skips the replicas on the excluded disks:
-// a GET that found a corrupt copy asks again for another one.
-func (sh *shard) lookupExcluding(ctx context.Context, name string, excl map[*localDisk]bool) (*found, error) {
+// lookupExcluding is lookup that skips the replicas in excl: a GET that found
+// a corrupt copy asks again for another one.
+func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusions) (*found, bool, error) {
 	sh.mu.Lock()
 	if err := sh.loadLocked(ctx); err != nil {
 		sh.mu.Unlock()
-		return nil, err
+		return nil, false, err
 	}
 	ov := sh.open
 	sealed := append([]catalogue.Volume(nil), sh.sealed...)
@@ -367,22 +387,39 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl map[*loc
 	if ov != nil {
 		if e, ok := ov.omap.Get(name); ok {
 			f, err := sh.readOpen(ov, e.Loc, name, excl)
-			if err != nil {
-				return nil, err
+			switch {
+			case err == nil:
+				f, err = sh.checkErased(f, ov.vol.ID, erased)
+				return f, false, err
+			case errors.Is(err, errNoIntactReplica):
+				return nil, false, err
 			}
-			return sh.checkErased(f, ov.vol.ID, erased)
+			sh.unreadable()
+			return nil, true, nil
 		}
 	}
 	for _, v := range sealed {
-		f, err := sh.lookupSealed(v, name, excl)
+		f, unreadable, err := sh.lookupSealed(v, name, excl)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if unreadable {
+			sh.unreadable()
+			return nil, true, nil
 		}
 		if f != nil {
-			return sh.checkErased(f, v.ID, erased)
+			f, err = sh.checkErased(f, v.ID, erased)
+			return f, false, err
 		}
 	}
-	return nil, errNoSuchName
+	return nil, false, errNoSuchName
+}
+
+// unreadable raises the alarm for a volume nobody can read. The node keeps
+// serving everything it can: writes continue, reads that this volume cannot
+// influence still answer.
+func (sh *shard) unreadable() {
+	sh.n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a volume has no readable replica; lookups for names it may hold are refused")
 }
 
 func (sh *shard) checkErased(f *found, vid catalogue.VolumeID, erased map[catalogue.Locator]struct{}) (*found, error) {
@@ -395,11 +432,14 @@ func (sh *shard) checkErased(f *found, vid catalogue.VolumeID, erased map[catalo
 }
 
 // readOpen reads the record of an open volume's name-map entry from the first
-// replica that serves it.
-func (sh *shard) readOpen(ov *openVolume, loc volume.Locator, name string, excl map[*localDisk]bool) (*found, error) {
+// replica that serves it. errNoIntactReplica: every replica holding it was
+// excluded as corrupt.
+func (sh *shard) readOpen(ov *openVolume, loc volume.Locator, name string, excl exclusions) (*found, error) {
 	var lastErr error
+	sawExcluded := false
 	for _, r := range ov.reps {
-		if excl[r.d] {
+		if excl[exclKey{r.d, ov.vol.ID}] {
+			sawExcluded = true
 			continue
 		}
 		f, err := r.d.fs.OpenFile(volume.Path(sh.bucket, ov.id), 0)
@@ -413,37 +453,48 @@ func (sh *shard) readOpen(ov *openVolume, loc volume.Locator, name string, excl 
 			lastErr = err
 			continue
 		}
-		return &found{disk: r.d, head: h, release: func() { f.Close() }, volumeNum: ov.vol.VolumeNumber, fromOpenVol: true}, nil
+		return &found{disk: r.d, vol: ov.vol.ID, head: h, release: func() { f.Close() }, volumeNum: ov.vol.VolumeNumber, fromOpenVol: true}, nil
+	}
+	if sawExcluded {
+		return nil, errNoIntactReplica
 	}
 	return nil, fmt.Errorf("read open volume: %w", lastErr)
 }
 
 // lookupSealed returns the name's record in a sealed volume, or nil if the
-// volume has none. Replicas are tried in turn when one fails.
-func (sh *shard) lookupSealed(v catalogue.Volume, name string, excl map[*localDisk]bool) (*found, error) {
-	var lastErr error
-	tried := 0
+// volume has none. Replicas are tried in turn when one fails. unreadable: no
+// replica could answer (all failed, lost or not usable), so the volume may
+// hold the name without anyone being able to say.
+func (sh *shard) lookupSealed(v catalogue.Volume, name string, excl exclusions) (f *found, unreadable bool, err error) {
+	if v.RecordCount == 0 {
+		// Sealed with nothing in it, e.g. a volume whose creation crashed
+		// between registration and its files (recovery seals it at length 0).
+		return nil, false, nil
+	}
+	sawExcluded := false
 	for _, rep := range v.Replicas {
 		if rep.State != catalogue.ReplicaOK {
 			continue
 		}
 		d := sh.n.byID[rep.Disk]
-		if d == nil || excl[d] {
+		if d == nil {
 			continue
 		}
-		tried++
+		if excl[exclKey{d, v.ID}] {
+			sawExcluded = true
+			continue
+		}
 		hit, err := d.store.Lookup(sh.bucket, uint64(v.ID), name)
 		if errors.Is(err, nameindex.ErrNotFound) {
-			return nil, nil
+			return nil, false, nil
 		}
 		if err != nil {
-			lastErr = err
 			continue
 		}
-		return &found{disk: d, head: hit.Head, release: hit.Release, volumeNum: v.VolumeNumber}, nil
+		return &found{disk: d, vol: v.ID, head: hit.Head, release: hit.Release, volumeNum: v.VolumeNumber}, false, nil
 	}
-	if tried == 0 {
-		return nil, nil // a volume with no usable replica holds nothing readable
+	if sawExcluded {
+		return nil, false, errNoIntactReplica
 	}
-	return nil, fmt.Errorf("lookup in sealed volume: %w", lastErr)
+	return nil, true, nil
 }

@@ -55,12 +55,15 @@ type Node struct {
 	cfg Config
 	d   Deps
 
-	nodeID   catalogue.NodeID
-	meta     catalogue.Meta
-	instance [16]byte
-	disks    []*localDisk
-	byID     map[catalogue.DiskID]*localDisk
-	ids      *idCounter
+	nodeID catalogue.NodeID
+	meta   catalogue.Meta // as read at Start; immutable afterwards
+	// incarnation is the catalogue incarnation last seen. Only heartbeat
+	// touches it, and heartbeat never runs concurrently with itself.
+	incarnation int64
+	instance    [16]byte
+	disks       []*localDisk
+	byID        map[catalogue.DiskID]*localDisk
+	ids         *idCounter
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
@@ -169,6 +172,7 @@ func (n *Node) checkCatalogue(ctx context.Context) error {
 		return fmt.Errorf("node start: this binary (compat %d) is older than the catalogue requires (%d)", compatLevel, m.MinCompat)
 	}
 	n.meta = m
+	n.incarnation = m.Incarnation
 	n.nodeID, err = n.d.Catalogue.AssignNodeID(ctx, n.cfg.NodeName)
 	if err != nil {
 		return fmt.Errorf("node start: %w", err)
@@ -528,11 +532,11 @@ func (n *Node) heartbeat(ctx context.Context) error {
 		return err
 	}
 	n.d.Alarms.Clear(AlarmCatalogueUnavailable)
-	if m.ClusterID != n.meta.ClusterID || m.Incarnation != n.meta.Incarnation {
+	if m.ClusterID != n.meta.ClusterID || m.Incarnation != n.incarnation {
 		// A failover changed the catalogue's incarnation: every lease and open
 		// volume is suspect. Abandon them; the next lease holder seals.
 		n.d.Alarms.Raise(AlarmShardLeaseLost, Critical, "catalogue incarnation changed")
-		n.meta = m
+		n.incarnation = m.Incarnation
 		n.mu.Lock()
 		for _, sh := range n.shards {
 			sh.mu.Lock()
