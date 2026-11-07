@@ -69,7 +69,10 @@ type shard struct {
 	// visible to lookups through the in-memory name map until the seal is
 	// retried (tick) or recovered (next lease acquisition). Reads only.
 	pending []*openVolume
-	erased  map[catalogue.Locator]struct{}
+	// erased is immutable once assigned: lookups copy the reference under mu
+	// and read it after unlocking. Replace it (copy-on-write), never modify
+	// it in place.
+	erased map[catalogue.Locator]struct{}
 }
 
 // loadLocked reads the shard's volumes and erasure list once.
@@ -105,10 +108,11 @@ func (sh *shard) refreshLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	sh.erased = make(map[catalogue.Locator]struct{}, len(er))
+	erased := make(map[catalogue.Locator]struct{}, len(er))
 	for _, l := range er {
-		sh.erased[l] = struct{}{}
+		erased[l] = struct{}{}
 	}
+	sh.erased = erased // published complete, never modified afterwards
 	sh.loaded = true
 	return nil
 }
@@ -502,20 +506,40 @@ type found struct {
 	fromOpenVol bool
 }
 
-// lookup finds the latest version of name: the open volume first, then the
-// sealed volumes newest first (docs/node.md §5). The first verified hit wins.
-//
-// uncertain means a volume that may hold a newer version could not be read by
-// any replica: the result is then (nil, true, nil), because an older version
-// must never stand in for the latest. Readers turn that into 503; an
-// unconditional write goes on (a new version is always the highest).
+// lookup finds the latest version of name (docs/node.md §5): open, pending
+// and sealed volumes are visited newest volume number first and the first
+// verified hit wins. See lookupExcluding for the results.
 func (sh *shard) lookup(ctx context.Context, name string) (f *found, uncertain bool, err error) {
 	return sh.lookupExcluding(ctx, name, nil)
 }
 
 // lookupExcluding is lookup that skips the replicas in excl: a GET that found
 // a corrupt copy asks again for another one.
-func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusions) (*found, bool, error) {
+//
+// Exactly one of these outcomes:
+//
+//	hit            f != nil, uncertain == false, err == nil
+//	               The latest version. The caller must call f.release().
+//	not found      f == nil, uncertain == false, err == errNoSuchName
+//	               No volume holds the name.
+//	erased         f == nil, uncertain == false, err == errNameErased
+//	               The latest version is on the erasure list.
+//	uncertain      f == nil, uncertain == true,  err == nil
+//	               Some volume that may hold a newer version than anything we
+//	               could read has no replica that can answer (all failed, lost
+//	               or unreadable). We cannot say what the latest version is, and
+//	               an older version must never stand in for it. Readers answer
+//	               503; an unconditional write goes on and stores a new version
+//	               (always the highest); a conditional write answers 503. The
+//	               replica-unavailable alarm is raised.
+//	no intact copy f == nil, uncertain == false, err == errNoIntactReplica
+//	               The record exists but every replica of it is in excl
+//	               (corrupt). Never wrong bytes: the caller answers 500.
+//	failure        f == nil, uncertain == false, err is any other error
+//	               (catalogue unreachable while loading the shard, ...).
+//
+// A volume with no records is skipped, never uncertain.
+func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusions) (f *found, uncertain bool, err error) {
 	sh.mu.Lock()
 	if err := sh.loadLocked(ctx); err != nil {
 		sh.mu.Unlock()
