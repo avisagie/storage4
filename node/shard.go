@@ -19,8 +19,6 @@ import (
 var (
 	// errNoSuchName: no version of the name exists (HTTP 404).
 	errNoSuchName = errors.New("node: no such name")
-	// errNameErased: the name's latest version is on the erasure list (410).
-	errNameErased = errors.New("node: name erased")
 	// errNoReplicaSet: fewer than ReplicaCount usable disks (503).
 	errNoReplicaSet = errors.New("node: no healthy replica set")
 	// errLeaseUnavailable: the shard lease cannot be held (503).
@@ -69,13 +67,9 @@ type shard struct {
 	// visible to lookups through the in-memory name map until the seal is
 	// retried (tick) or recovered (next lease acquisition). Reads only.
 	pending []*openVolume
-	// erased is immutable once assigned: lookups copy the reference under mu
-	// and read it after unlocking. Replace it (copy-on-write), never modify
-	// it in place.
-	erased map[catalogue.Locator]struct{}
 }
 
-// loadLocked reads the shard's volumes and erasure list once.
+// loadLocked reads the shard's volumes once.
 func (sh *shard) loadLocked(ctx context.Context) error {
 	if sh.loaded {
 		return nil
@@ -83,7 +77,8 @@ func (sh *shard) loadLocked(ctx context.Context) error {
 	return sh.refreshLocked(ctx)
 }
 
-// refreshLocked re-reads the sealed volumes and the erasure list.
+// refreshLocked re-reads the sealed volumes. The erasure list is not read:
+// the node never consults it (an erased name reads as 404; docs/node.md §9).
 func (sh *shard) refreshLocked(ctx context.Context) error {
 	vols, err := sh.n.d.Catalogue.ListShardVolumes(ctx, sh.bucket, sh.idx)
 	if err != nil {
@@ -104,15 +99,6 @@ func (sh *shard) refreshLocked(ctx context.Context) error {
 		}
 	}
 	sh.pending = keep
-	er, err := sh.n.d.Catalogue.ShardErasures(ctx, sh.bucket, sh.idx)
-	if err != nil {
-		return err
-	}
-	erased := make(map[catalogue.Locator]struct{}, len(er))
-	for _, l := range er {
-		erased[l] = struct{}{}
-	}
-	sh.erased = erased // published complete, never modified afterwards
 	sh.loaded = true
 	return nil
 }
@@ -521,9 +507,8 @@ func (sh *shard) lookup(ctx context.Context, name string) (f *found, uncertain b
 //	hit            f != nil, uncertain == false, err == nil
 //	               The latest version. The caller must call f.release().
 //	not found      f == nil, uncertain == false, err == errNoSuchName
-//	               No volume holds the name.
-//	erased         f == nil, uncertain == false, err == errNameErased
-//	               The latest version is on the erasure list.
+//	               No volume holds the name (or it was erased: an erased name
+//	               reads as 404, never 410, so erasure leaks nothing).
 //	uncertain      f == nil, uncertain == true,  err == nil
 //	               Some volume that may hold a newer version than anything we
 //	               could read has no replica that can answer (all failed, lost
@@ -548,7 +533,6 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 	ov := sh.open
 	pend := append([]*openVolume(nil), sh.pending...)
 	sealed := append([]catalogue.Volume(nil), sh.sealed...)
-	erased := sh.erased
 	sh.mu.Unlock()
 
 	// Newest volume first by volume number: the open volume, pending (unsealed)
@@ -579,8 +563,7 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 			f, err := sh.readOpen(c.ov, e.Loc, name, excl)
 			switch {
 			case err == nil:
-				f, err = sh.checkErased(f, c.ov.vol.ID, erased)
-				return f, false, err
+				return f, false, nil
 			case errors.Is(err, errNoIntactReplica):
 				return nil, false, err
 			}
@@ -596,8 +579,7 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 			return nil, true, nil
 		}
 		if f != nil {
-			f, err = sh.checkErased(f, c.sealed.ID, erased)
-			return f, false, err
+			return f, false, nil
 		}
 	}
 	return nil, false, errNoSuchName
@@ -608,15 +590,6 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 // influence still answer.
 func (sh *shard) unreadable() {
 	sh.n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a volume has no readable replica; lookups for names it may hold are refused")
-}
-
-func (sh *shard) checkErased(f *found, vid catalogue.VolumeID, erased map[catalogue.Locator]struct{}) (*found, error) {
-	l := f.head.Locator()
-	if _, gone := erased[catalogue.Locator{Volume: vid, Seq: l.Seq, Check: l.Check}]; gone {
-		f.release()
-		return nil, errNameErased
-	}
-	return f, nil
 }
 
 // readOpen reads the record of an open volume's name-map entry from the first

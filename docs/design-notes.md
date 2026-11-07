@@ -88,7 +88,7 @@ Transitions are triggered by the application (or an operator policy on its behal
 | Request | Body / headers | Result |
 |---|---|---|
 | `PUT /b/{bucket}/{name...}` | Raw file (`application/octet-stream`), or `multipart/form-data` with optional `metadata` part **first**, then exactly one `file` part. Optional `Content-Digest: sha-256=:…:`, `If-None-Match: *`, `If-Match: "<etag>"` | `201` new version stored; `200` identical to latest — nothing stored. Both return `ETag` (SHA-256) and `Repr-Digest` |
-| `GET /b/{bucket}/{name...}` | Optional `If-None-Match: "<etag>"` | Latest version's bytes + `ETag`, `Repr-Digest`; `304` if unchanged; `404` unknown; `410` erased or bucket deleted |
+| `GET /b/{bucket}/{name...}` | Optional `If-None-Match: "<etag>"` | Latest version's bytes + `ETag`, `Repr-Digest`; `304` if unchanged; `404` unknown or erased; `410` bucket deleted |
 | `HEAD /b/{bucket}/{name...}` | — | Headers only (existence, size, `ETag`) |
 | `GET /m/{bucket}/{name...}` | — | Latest version's metadata bytes; `204` if none |
 | `DELETE /b/{bucket}/{name...}` | — | Best-effort erase of **all versions** (§11); `202` |
@@ -407,11 +407,11 @@ store db      – catalogue bootstrap, init, status, migrate, verify (§13)
 **Requirement:** rare; remove a file's name, content and metadata. Freeing space is **not** required. `DELETE /b/{bucket}/{name}` erases **all versions** of the name.
 
 **Mechanism:**
-1. The shard owner looks up every version of the name (all of the shard's volumes) and inserts their locators into the catalogue's **erasure list** → reads return `410` immediately (the owner caches the list). The list is permanent and exported with the deletion log.
+1. The shard owner looks up every version of the name (all of the shard's volumes) and inserts their locators into the catalogue's **erasure list** (the durable work queue; permanent; exported with the deletion log). The node's read path never consults the list: an erased name reads as `404` once its records are zeroed (decided 2026-11-07: `410` would reveal that the name existed, and a per-lookup check would put the list on the hot path). Erasure is regulatory deletion, not a transaction; the operator confirms that all replicas applied it.
 2. Volumes still open are sealed first (keeps erasure off the append path).
 3. Each replica holder, idempotently: verify the record header; in one contiguous write set `type = erased-file`, zero region A (name, sha256, metadata) and rewrite the header CRC; then zero the payload in chunks; fsync. (Head first, so the record is valid at every later step — format-v1 §7.) The erase RPC carries (volume, offset, seq, check, name), never the zeros. Record lengths unchanged → every later record keeps its offset; `.idx` unchanged.
-4. Zero the record's entry in the seal-footer metadata copy, if present. `.nidx` files are immutable: lookups filter erased versions through the erasure list; scrub/rebuild produce index files without them.
-5. The catalogue tracks which replicas have applied it; offline disks apply pending erasures on reconcile; scan/rebuild re-applies the list.
+4. Zero the record's entry in the seal-footer metadata copy, if present. `.nidx` files are immutable: a lookup that reaches an erased-in-place record stops and answers `404` (it must not fall through to an older version); scrub/rebuild re-apply the erasure list first and produce index files without erased records.
+5. The catalogue tracks which replicas have applied it; offline disks apply pending erasures on reconcile; scan/rebuild re-applies the list. A replica that has not applied all erasures of a volume is marked as such (see `mvp-plan.md`, "erase-stale") so reads prefer replicas that have.
 6. A later `PUT` of the same name stores a new version normally.
 
 **Best effort, by design:**

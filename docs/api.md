@@ -53,7 +53,7 @@ Limits: file > 100 MiB or metadata > 16 KiB → `413` (checked as early as possi
 - `200` with the latest version's bytes (`GET`), or headers only (`HEAD`). Headers: `ETag`, `Repr-Digest`, `Content-Length`, `Content-Type: application/octet-stream`.
 - `If-None-Match: "<etag>"` equal to the latest ETag → `304`.
 - Range requests are not supported in v1: `Range` is ignored and the full body returned. **[REVIEW]**
-- `404` name unknown (or bucket unknown); `410` the name was erased, or the bucket is deleted.
+- `404` name unknown, **or erased** (an erased name is indistinguishable from one that never existed, so erasure leaks nothing; decided 2026-11-07), or bucket unknown; `410` the bucket is deleted.
 - The response body is verified against the record (name, CRCs) before the first byte is sent; a corrupt replica is skipped in favour of another.
 
 ### 2.3 `GET /m/{bucket}/{name...}`
@@ -62,7 +62,7 @@ Returns the latest version's metadata bytes, byte for byte, `Content-Type: appli
 
 ### 2.4 `DELETE /b/{bucket}/{name...}`
 
-Erases the name, content and metadata of **all versions**, best effort (in-place zeroing on every replica; tape, remapped SSD blocks and drives that left the site are not reached). Returns `202` once the erasure is recorded; reads return `410` from then on. Idempotent: erasing an unknown name returns `202` as well, and erasing again returns `202`. A later `PUT` of the same name stores a new version normally. Space is not reclaimed until the bucket is deleted.
+Erases the name, content and metadata of **all versions**, best effort (in-place zeroing on every replica; tape, remapped SSD blocks and drives that left the site are not reached). Returns `202` once the erasure is recorded. The data is destroyed on the replicas by the erase worker shortly after; there is no guarantee that reads stop at the instant of the `202` (regulatory deletion, not a transaction: the operator confirms that all replicas applied it before deleting the referencing records). Once destroyed, the name reads as `404`. Idempotent: erasing an unknown name returns `202` as well, and erasing again returns `202`. A later `PUT` of the same name stores a new version normally. Space is not reclaimed until the bucket is deleted.
 
 ### 2.5 `PUT /b/{bucket}`
 
@@ -81,7 +81,7 @@ Error responses have a short plain-text body (`text/plain`, one line, no names, 
 | `400` | invalid bucket/name, malformed multipart or JSON, `Content-Digest` mismatch, conflicting conditions |
 | `404` | name or bucket unknown |
 | `405` | method not allowed on this path |
-| `410` | name erased, or bucket deleted |
+| `410` | bucket deleted |
 | `412` | `If-None-Match` / `If-Match` condition failed |
 | `413` | file > 100 MiB or metadata > 16 KiB |
 | `415` | unsupported request content type |

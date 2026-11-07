@@ -56,8 +56,8 @@ func (n *Node) put(ctx context.Context, b catalogue.Bucket, name string, r putRe
 		}
 		// Unconditional: skip dedup and store a new version, which is
 		// always the highest. Write availability over a saved duplicate.
-	case errors.Is(err, errNoSuchName), errors.Is(err, errNameErased):
-		// Erased names store a new version normally (api.md §2.4).
+	case errors.Is(err, errNoSuchName):
+		// Includes erased names, which store a new version normally (api.md §2.4).
 	default:
 		return false, err
 	}

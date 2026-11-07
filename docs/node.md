@@ -86,7 +86,7 @@ The result is `{locator, sha256, volume number}`; metadata is read from the reco
 ### The PUT sequence on the owner
 
 1. `lockName(bucket, name)`: striped mutex, 256 stripes keyed by a hash of (bucket, name). Held until the append is acked and the `OpenMap` is updated, or until the request returns without writing. Different names proceed in parallel and still share group commits. Needed because lookup-then-append is not atomic: a client retry can overlap its first request, and two identical PUTs (or two `If-Match` writers) could otherwise both pass the check.
-2. Look up the latest version. A name on the erasure list (§9) counts as not existing.
+2. Look up the latest version. An erased name does not exist as far as the node is concerned (§9).
 3. Conditions, against the latest version: `If-None-Match: *` and a version exists → `412`; `If-Match` and the ETag differs (or no version) → `412`.
 4. **Dedup**: if the latest version's sha256 equals the new file's sha256, read region A of that record (`ReadHead`) and compare the metadata bytes (absent = empty). Both equal → `200`, nothing stored. Otherwise continue. (Metadata is compared only after a sha256 match; decided 2026-11-05: a metadata change with identical content is a new version.)
 5. Append to the shard's open volume (§6), wait for all replicas to fsync.
@@ -122,9 +122,16 @@ Per `docs/api.md`. Order of checks for a PUT: auth (`401`) → query string (`40
 
 **Memory budget**: a byte-counting semaphore (`TryAcquire(n)`). A request reserves `Content-Length` (or the 100 MiB cap + 16 KiB when unknown, shrinking after the body is read), releases when the response is complete. `MemoryBudget` must be at least that cap, enforced in `Start`.
 
-## 9. Erasure list (wired, empty in milestone 6)
+## 9. Erasure (nothing on the read path; decided 2026-11-07)
 
-The owner loads `ShardErasures` when it takes a shard lease and consults it on every hit. Rule for milestone 8 to keep: a hit whose locator is on the list means the **name is erased** (stop searching; do not fall through to an older volume). Open item: `nameindex.Store.Lookup` currently skips an erased-in-place candidate and goes on to older volumes; while an erasure is half applied that could surface an older live version. Milestone 8 changes `Lookup` to report "erased candidate" so the node can stop. Not reachable in milestone 6 (no erasures).
+The node does not read the erasure list: it is a durable work queue for the erase worker, scan/rebuild and restore (milestone 8), not part of lookup. An erased name reads as `404`, like a name that never existed (`410` would reveal that it existed; `410` stays for deleted buckets). Erasure is regulatory deletion, not a transaction: the operator confirms that the replicas applied it before deleting the referencing records, so reads in the short window after the `202` are not a requirement.
+
+Rules for milestone 8 to keep:
+
+- `nameindex.Store.Lookup` must report an **erased candidate** (the `.nidx` entry points at a record of type `erased-file`) and the node must stop there with `404`. Today an erased-in-place candidate is skipped like a fingerprint collision and the search goes on to older volumes; while an erasure is half applied (it zeroes version by version) that could surface an older live version.
+- A rebuilt `.nidx` has no entry for an erased record (its name is zeroed), so rebuild must re-apply the erasure list before indexing (design-notes §11).
+- A replica that has not applied all erasures of its volume should be marked in the catalogue and used last, so reads prefer replicas that have (`mvp-plan.md`, "erase-stale").
+- An erase and a write of the same name take the same per-name lock.
 
 ## 10. Alarms and metrics
 
@@ -144,7 +151,7 @@ Per open volume: one committer. Per node: one maintenance loop (lease renewals, 
 1. `node-counter` is best effort: one disk suffices, `503` only if none takes it (§3, decided 2026-11-06).
 2. `Clock.After` added (§2); group commit without a window (§6).
 3. Fewer than three usable disks → `503`, no degraded mode (§3).
-4. `Lookup` change for erased candidates, scheduled in milestone 8 (§9).
+4. `Lookup` change for erased candidates (stop with `404`), scheduled in milestone 8 (§9).
 
 ## Implementation notes (2026-11-05)
 

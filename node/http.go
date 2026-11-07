@@ -153,7 +153,7 @@ func (n *Node) fail(w http.ResponseWriter, err error) {
 		plain(w, http.StatusUnsupportedMediaType, "unsupported content type")
 	case errors.Is(err, errPrecondition):
 		plain(w, http.StatusPreconditionFailed, "precondition failed")
-	case errors.Is(err, catalogue.ErrBucketDeleted), errors.Is(err, errNameErased):
+	case errors.Is(err, catalogue.ErrBucketDeleted):
 		plain(w, http.StatusGone, "gone")
 	case errors.Is(err, catalogue.ErrBucketNotFound), errors.Is(err, errNoSuchName):
 		plain(w, http.StatusNotFound, "not found")
