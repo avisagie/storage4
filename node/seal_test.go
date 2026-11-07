@@ -17,6 +17,9 @@ import (
 type flakyCat struct {
 	catalogue.Catalogue
 	failBegin, failFinish atomic.Bool
+	// lostFinishAck: FinishSeal commits but the caller sees a failure, as
+	// when the connection drops after the commit.
+	lostFinishAck atomic.Bool
 }
 
 func (f *flakyCat) BeginSeal(ctx context.Context, l catalogue.Lease, id catalogue.VolumeID) (uint32, error) {
@@ -30,7 +33,11 @@ func (f *flakyCat) FinishSeal(ctx context.Context, l catalogue.Lease, id catalog
 	if f.failFinish.Load() {
 		return catalogue.ErrUnavailable
 	}
-	return f.Catalogue.FinishSeal(ctx, l, id, epoch, committed, records)
+	err := f.Catalogue.FinishSeal(ctx, l, id, epoch, committed, records)
+	if err == nil && f.lostFinishAck.Load() {
+		return catalogue.ErrUnavailable
+	}
+	return err
 }
 
 // newSealRig starts a node with small volumes (they fill after about three
@@ -328,4 +335,39 @@ func testReplicasByteIdenticalAfterSeal(t *testing.T) {
 
 func TestReplicasByteIdenticalAfterSeal(t *testing.T) {
 	eachBackend(t, testReplicasByteIdenticalAfterSeal)
+}
+
+// FinishSeal commits but its answer is lost: the volume is pending here, yet
+// already sealed in the catalogue. The retry must notice (BeginSeal says
+// ErrVolumeSealed) and finish, not stay pending forever with the alarm on and
+// the lease held.
+func testPendingSealAlreadySealedByCatalogue(t *testing.T) {
+	r, fc := newSealRig(t, nil)
+	fc.lostFinishAck.Store(true)
+	acked := fillUntilSealFails(t, r)
+	fc.lostFinishAck.Store(false)
+	if r.pendingSeals() != 1 || r.sealedCount(t) != 1 {
+		t.Fatalf("setup: pending %d, sealed in catalogue %d", r.pendingSeals(), r.sealedCount(t))
+	}
+	r.wantAllReadable(t, acked)
+	r.ticks(t, 2)
+	eventually(t, "pending seal to resolve", func() bool { return r.pendingSeals() == 0 })
+	if r.alarmActive(AlarmSealPending) {
+		t.Fatal("alarm not cleared")
+	}
+	r.wantAllReadable(t, acked)
+	r.ticks(t, 1)
+	eventually(t, "idle lease release", func() bool {
+		_, held, _ := r.cat.ShardOwner(context.Background(), "c", 0)
+		return !held
+	})
+	// The shard keeps working: a write opens a new volume and wins over the sealed one.
+	r.want(r.put("/b/c/f0", []byte("newer")), 201)
+	if g := r.do("GET", "/b/c/f0", nil); string(g.body) != "newer" {
+		t.Fatalf("latest = %q", g.body)
+	}
+}
+
+func TestPendingSealAlreadySealedByCatalogue(t *testing.T) {
+	eachBackend(t, testPendingSealAlreadySealedByCatalogue)
 }

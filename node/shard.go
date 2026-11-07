@@ -340,27 +340,66 @@ func (sh *shard) retryPendingLocked(ctx context.Context) {
 	}
 }
 
-// sealVolumeLocked runs the two-phase seal of ov at ov.final. live: the
-// replica writers are still open and may seal themselves; otherwise (or if any
-// writer is not clean) every replica is sealed from its file, with one seal
-// check drawn for all so the replicas stay byte-identical.
+// sealVolumeLocked runs the two-phase seal of ov at ov.final (the minimum
+// committed length over its replicas, fixed once the committer stopped). The
+// caller holds sh.mu and keeps the volume pending if this returns an error;
+// every step below is safe to repeat.
 //
-// The catalogue is told the volume is sealed only if at least one replica
-// really is. If none could be sealed the volume stays unsealed (the caller
-// keeps it pending): the data may be perfectly intact, and recording it as
-// empty would hide acknowledged records.
+// Steps:
+//  1. Fence: BeginSeal (catalogue) bumps the epoch and marks the volume
+//     sealing. Without the catalogue nothing can be sealed, so a failure here
+//     leaves everything untouched.
+//  2. Choose how to seal. live: the replica writers are still open, all clean
+//     and at the committed length, so each writer seals itself and hands over
+//     its in-memory index. Otherwise (a retry, a writer that failed, a replica
+//     behind the others) every writer is closed and every replica is sealed
+//     from its file by SealFile, with one seal check drawn for all so the
+//     replicas stay byte-identical.
+//  3. Seal each replica independently, then write its .idx and .nidx caches.
+//     A replica that fails to seal goes on the dud list. An index file that
+//     fails to write is only a cache miss (alarm, rebuilt on demand), not a
+//     failed seal.
+//  4. If no replica sealed, stop: return errNoReplicaSealed and leave the
+//     volume unsealed in the catalogue. The data may be perfectly intact, and
+//     recording the volume as empty would hide acknowledged records.
+//  5. Otherwise mark the duds failed in the catalogue, now that at least one
+//     good replica proves the committed prefix can be sealed.
+//  6. FinishSeal records the committed length and record count; the volume
+//     joins sh.sealed.
+//
+// A dud is a replica that failed to seal in an attempt where at least one
+// other replica did seal: an IO error on the seal write or fsync, a missing
+// file, or a file shorter than the committed length. The catalogue marks it
+// failed, reads stop using it, and it is repaired by copying from a good
+// replica (milestone 8; "seal, don't repair" here). The definition is relative
+// on purpose: if every replica fails, nobody is known to be a dud (the cause
+// may be the catalogue, a full disk or a bug), so none is marked. See
+// docs/node.md, "Seals that cannot complete".
 func (sh *shard) sealVolumeLocked(ctx context.Context, ov *openVolume, reason string, live bool) error {
 	n := sh.n
 	if !sh.leased {
 		return errLeaseUnavailable
 	}
+	// Step 1: fence.
 	epoch, err := n.d.Catalogue.BeginSeal(ctx, sh.lease, ov.vol.ID)
+	if errors.Is(err, catalogue.ErrVolumeSealed) {
+		// Already sealed: an earlier attempt of ours whose FinishSeal
+		// committed but whose answer was lost, or another seal pass. Nothing
+		// is left to do but to learn the result.
+		v, gerr := n.d.Catalogue.GetVolume(ctx, ov.vol.ID)
+		if gerr != nil {
+			return fmt.Errorf("seal (%s): %w", reason, gerr)
+		}
+		sh.addSealedLocked(v)
+		return nil
+	}
 	if err != nil {
 		if errors.Is(err, catalogue.ErrLeaseLost) {
 			sh.leased = false
 		}
 		return fmt.Errorf("seal (%s): %w", reason, err)
 	}
+	// Step 2: live or from files.
 	committed := ov.final
 	if live {
 		for _, r := range ov.reps {
@@ -377,6 +416,7 @@ func (sh *shard) sealVolumeLocked(ctx context.Context, ov *openVolume, reason st
 		chk := n.randUint32()
 		rnd = func() uint32 { return chk }
 	}
+	// Step 3: seal every replica independently; collect the duds.
 	path := volume.Path(sh.bucket, ov.id)
 	var records uint32
 	var failed []*replicaW
@@ -412,26 +452,39 @@ func (sh *shard) sealVolumeLocked(ctx context.Context, ov *openVolume, reason st
 			n.d.Alarms.Raise(AlarmIndexRebuilt, Info, "an index file could not be written at seal")
 		}
 	}
+	// Step 4: nobody sealed, so nobody is known to be a dud.
 	if !sealedAny {
 		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "no replica of a volume could be sealed")
 		return fmt.Errorf("seal (%s): %w", reason, errNoReplicaSealed)
 	}
-	// Mark the duds only now: with no replica sealed nobody is a dud yet.
+	// Step 5: mark the duds, now that a good replica exists.
 	for _, r := range failed {
 		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a replica could not be sealed")
 		if err := n.d.Catalogue.SetReplicaState(ctx, ov.vol.ID, r.d.id, catalogue.ReplicaFailed); err != nil {
 			return fmt.Errorf("seal (%s): mark replica: %w", reason, err)
 		}
 	}
+	// Step 6: publish the result.
 	if err := n.d.Catalogue.FinishSeal(ctx, sh.lease, ov.vol.ID, epoch, committed, records); err != nil {
 		return fmt.Errorf("seal (%s): %w", reason, err)
 	}
 	n.cnt.volumesSealed.Add(1)
 	if v, err := n.d.Catalogue.GetVolume(ctx, ov.vol.ID); err == nil {
-		sh.sealed = append([]catalogue.Volume{v}, sh.sealed...)
-		sort.SliceStable(sh.sealed, func(i, j int) bool { return sh.sealed[i].VolumeNumber > sh.sealed[j].VolumeNumber })
+		sh.addSealedLocked(v)
 	}
 	return nil
+}
+
+// addSealedLocked adds a sealed volume to the shard's list (newest first),
+// once.
+func (sh *shard) addSealedLocked(v catalogue.Volume) {
+	for _, have := range sh.sealed {
+		if have.ID == v.ID {
+			return
+		}
+	}
+	sh.sealed = append([]catalogue.Volume{v}, sh.sealed...)
+	sort.SliceStable(sh.sealed, func(i, j int) bool { return sh.sealed[i].VolumeNumber > sh.sealed[j].VolumeNumber })
 }
 
 func ensureIdx(fsys disk.FS, bucket string, id uint64) (*volume.Idx, bool, error) {
