@@ -95,6 +95,11 @@ func SealFile(fsys disk.FS, path string, committed int64, epoch uint32, rnd func
 			return format.Seal{}, fmt.Errorf("volume seal %s: sealed at %d, asked %d: %w",
 				path, full.Seal.CommittedLength, committed, ErrSealMismatch)
 		}
+		// Already sealed here, perhaps by an attempt whose fsync failed:
+		// make sure the seal record is durable before reporting success.
+		if err := f.Sync(); err != nil {
+			return format.Seal{}, fmt.Errorf("volume seal %s: %w", path, err)
+		}
 		return *full.Seal, nil
 	}
 	if committed < 0 || committed > size {

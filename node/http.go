@@ -165,7 +165,7 @@ func (n *Node) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, catalogue.ErrUnavailable), errors.Is(err, catalogue.ErrLeaseHeld),
 		errors.Is(err, catalogue.ErrLeaseLost), errors.Is(err, errNoReplicaSet),
 		errors.Is(err, errLeaseUnavailable), errors.Is(err, errTooManyOpen),
-		errors.Is(err, errRetriesExhausted), errors.Is(err, errLookupUncertain),
+		errors.Is(err, errRetriesExhausted), errors.Is(err, errLookupUncertain), errors.Is(err, errNoReplicaSealed),
 		errors.Is(err, errCounterUnavailable), errors.Is(err, context.Canceled):
 		retryLater(w, http.StatusServiceUnavailable, "unavailable")
 	default:

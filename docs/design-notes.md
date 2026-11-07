@@ -112,7 +112,7 @@ curl http://node:8080/b/docs-2026-10-29/2026-10-29T12:00:00Z/6f1c…/page -o sca
 **Application responsibilities (not storage concerns):** choosing bucket and file names and keeping names unique per document/role; never writing the same name concurrently; calling `delete_bucket` at end of retention; storing (bucket, name) in ES; optional metadata.
 
 **Structure:**
-- Bucket → **S shards** (`shard = first 8 bytes of SHA-256(name) as big-endian u64 mod S`) → per (bucket, shard) a sequence of **volumes** (append-only pack files, a few GB, ≤ 32 GiB) → N replicas on distinct disks/servers. Replicas are byte-identical, except for erasures in progress (§11).
+- Bucket → **S shards** (`shard = first 8 bytes of SHA-256(name) as big-endian u64 mod S`) → per (bucket, shard) a sequence of **volumes** (append-only pack files, a few GB, ≤ 32 GiB) → N replicas on distinct disks/servers. Replicas are byte-identical, except for erasures in progress (§11); that includes the seal record, because one seal check is drawn per seal and used for every replica. A volume whose seal cannot complete stays readable (pending) and is retried; see `docs/node.md`, "Seals that cannot complete".
 - **S** is chosen when the bucket is created (explicit option or deployment default) and fixed for the bucket's life; recorded in the catalogue and in every volume header. Small or rarely written buckets use small S (fewer, fuller volumes); the busiest buckets use roughly the node count.
 - The **catalogue** maps volume → (bucket, shard, volume number, replica locations); nodes cache and refresh on "not here".
 

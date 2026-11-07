@@ -28,6 +28,9 @@ var (
 	// errLookupUncertain: a volume that may hold a newer version of the name
 	// cannot be read, so no older version may answer (503).
 	errLookupUncertain = errors.New("node: lookup uncertain, a volume is unreadable")
+	// errNoReplicaSealed: the volume's replicas are readable but none could be
+	// sealed; the volume is left unsealed (503).
+	errNoReplicaSealed = errors.New("node: no replica could be sealed")
 	// errNoIntactReplica: the record exists but every replica is corrupt (500).
 	errNoIntactReplica = errors.New("node: no intact replica of a record")
 )
@@ -61,7 +64,12 @@ type shard struct {
 	renewedAt time.Time
 	sealed    []catalogue.Volume
 	open      *openVolume
-	erased    map[catalogue.Locator]struct{}
+	// pending: volumes closed for writes whose seal did not complete (catalogue
+	// unreachable, no replica sealable). Their acknowledged records stay
+	// visible to lookups through the in-memory name map until the seal is
+	// retried (tick) or recovered (next lease acquisition). Reads only.
+	pending []*openVolume
+	erased  map[catalogue.Locator]struct{}
 }
 
 // loadLocked reads the shard's volumes and erasure list once.
@@ -79,11 +87,20 @@ func (sh *shard) refreshLocked(ctx context.Context) error {
 		return err
 	}
 	sh.sealed = sh.sealed[:0]
+	isSealed := map[catalogue.VolumeID]bool{}
 	for _, v := range vols {
 		if v.State == catalogue.VolumeSealed {
 			sh.sealed = append(sh.sealed, v)
+			isSealed[v.ID] = true
 		}
 	}
+	keep := sh.pending[:0]
+	for _, p := range sh.pending {
+		if !isSealed[p.vol.ID] {
+			keep = append(keep, p)
+		}
+	}
+	sh.pending = keep
 	er, err := sh.n.d.Catalogue.ShardErasures(ctx, sh.bucket, sh.idx)
 	if err != nil {
 		return err
@@ -270,50 +287,114 @@ func (sh *shard) sealOpen(ctx context.Context, ov *openVolume, reason string) er
 	return sh.sealOpenLocked(ctx, ov, reason)
 }
 
+// sealOpenLocked closes ov for writes and seals it. Whatever happens, the
+// volume stops being the open volume and frees its slots at once (writes go
+// on to a new volume). If the seal cannot complete, the volume becomes
+// pending: its acknowledged records stay readable and the seal is retried.
 func (sh *shard) sealOpenLocked(ctx context.Context, ov *openVolume, reason string) error {
 	n := sh.n
 	ov.close()
-	defer func() {
-		ov.released()
-		n.volumeClosed(ov)
-		sh.open = nil
-	}()
-	if !sh.leased {
-		for _, r := range ov.reps {
-			r.w.Close()
-		}
-		return errLeaseUnavailable
-	}
-	epoch, err := n.d.Catalogue.BeginSeal(ctx, sh.lease, ov.vol.ID)
+	ov.final = ov.committed()
+	sh.open = nil
+	ov.released()
+	n.volumeClosed(ov)
+	err := sh.sealVolumeLocked(ctx, ov, reason, true)
 	if err != nil {
 		for _, r := range ov.reps {
 			r.w.Close()
 		}
+		sh.addPendingLocked(ov)
+	}
+	return err
+}
+
+func (sh *shard) addPendingLocked(ov *openVolume) {
+	sh.pending = append(sh.pending, ov)
+	sh.n.d.Alarms.Raise(AlarmSealPending, Warning, "a volume could not be sealed; its records stay readable and the seal is retried")
+}
+
+// retryPendingLocked tries to seal every pending volume again. Replica
+// writers are gone by then, so replicas are sealed from their files.
+func (sh *shard) retryPendingLocked(ctx context.Context) {
+	if len(sh.pending) == 0 {
+		return
+	}
+	if !sh.leased {
+		if err := sh.acquireLocked(ctx); err != nil {
+			return // acquiring recovers (seals) leftovers itself when it succeeds
+		}
+	}
+	for _, ov := range append([]*openVolume(nil), sh.pending...) {
+		if err := sh.sealVolumeLocked(ctx, ov, "retry", false); err != nil {
+			continue
+		}
+		for i, p := range sh.pending {
+			if p == ov {
+				sh.pending = append(sh.pending[:i], sh.pending[i+1:]...)
+				break
+			}
+		}
+	}
+	if len(sh.pending) == 0 {
+		sh.n.d.Alarms.Clear(AlarmSealPending)
+	}
+}
+
+// sealVolumeLocked runs the two-phase seal of ov at ov.final. live: the
+// replica writers are still open and may seal themselves; otherwise (or if any
+// writer is not clean) every replica is sealed from its file, with one seal
+// check drawn for all so the replicas stay byte-identical.
+//
+// The catalogue is told the volume is sealed only if at least one replica
+// really is. If none could be sealed the volume stays unsealed (the caller
+// keeps it pending): the data may be perfectly intact, and recording it as
+// empty would hide acknowledged records.
+func (sh *shard) sealVolumeLocked(ctx context.Context, ov *openVolume, reason string, live bool) error {
+	n := sh.n
+	if !sh.leased {
+		return errLeaseUnavailable
+	}
+	epoch, err := n.d.Catalogue.BeginSeal(ctx, sh.lease, ov.vol.ID)
+	if err != nil {
 		if errors.Is(err, catalogue.ErrLeaseLost) {
 			sh.leased = false
 		}
 		return fmt.Errorf("seal (%s): %w", reason, err)
 	}
-	committed := ov.committed()
+	committed := ov.final
+	if live {
+		for _, r := range ov.reps {
+			if r.w.Err() != nil || r.w.Committed() != committed {
+				live = false
+			}
+		}
+	}
+	rnd := n.randUint32
+	if !live {
+		for _, r := range ov.reps {
+			r.w.Close()
+		}
+		chk := n.randUint32()
+		rnd = func() uint32 { return chk }
+	}
+	path := volume.Path(sh.bucket, ov.id)
 	var records uint32
+	var failed []*replicaW
 	sealedAny := false
 	builder := ov.omap.Builder()
 	for _, r := range ov.reps {
-		path := volume.Path(sh.bucket, ov.id)
 		var seal format.Seal
 		var idx *volume.Idx
 		var err error
-		if r.w.Err() == nil && r.w.Committed() == committed {
+		if live {
 			if seal, err = r.w.Seal(epoch); err == nil {
 				idx, err = r.w.Idx()
 			}
 		} else {
-			r.w.Close()
-			seal, err = volume.SealFile(r.d.fs, path, committed, epoch, n.randUint32)
+			seal, err = volume.SealFile(r.d.fs, path, committed, epoch, rnd)
 		}
 		if err != nil {
-			n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a replica could not be sealed")
-			_ = n.d.Catalogue.SetReplicaState(ctx, ov.vol.ID, r.d.id, catalogue.ReplicaFailed)
+			failed = append(failed, r)
 			continue
 		}
 		sealedAny = true
@@ -332,7 +413,15 @@ func (sh *shard) sealOpenLocked(ctx context.Context, ov *openVolume, reason stri
 		}
 	}
 	if !sealedAny {
-		committed, records = 0, 0
+		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "no replica of a volume could be sealed")
+		return fmt.Errorf("seal (%s): %w", reason, errNoReplicaSealed)
+	}
+	// Mark the duds only now: with no replica sealed nobody is a dud yet.
+	for _, r := range failed {
+		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a replica could not be sealed")
+		if err := n.d.Catalogue.SetReplicaState(ctx, ov.vol.ID, r.d.id, catalogue.ReplicaFailed); err != nil {
+			return fmt.Errorf("seal (%s): mark replica: %w", reason, err)
+		}
 	}
 	if err := n.d.Catalogue.FinishSeal(ctx, sh.lease, ov.vol.ID, epoch, committed, records); err != nil {
 		return fmt.Errorf("seal (%s): %w", reason, err)
@@ -380,16 +469,40 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 		return nil, false, err
 	}
 	ov := sh.open
+	pend := append([]*openVolume(nil), sh.pending...)
 	sealed := append([]catalogue.Volume(nil), sh.sealed...)
 	erased := sh.erased
 	sh.mu.Unlock()
 
+	// Newest volume first by volume number: the open volume, pending (unsealed)
+	// ones and sealed ones, so a version in a newer volume always wins.
+	type cand struct {
+		vn     int64
+		ov     *openVolume
+		sealed *catalogue.Volume
+	}
+	cands := make([]cand, 0, 1+len(pend)+len(sealed))
 	if ov != nil {
-		if e, ok := ov.omap.Get(name); ok {
-			f, err := sh.readOpen(ov, e.Loc, name, excl)
+		cands = append(cands, cand{vn: ov.vol.VolumeNumber, ov: ov})
+	}
+	for _, p := range pend {
+		cands = append(cands, cand{vn: p.vol.VolumeNumber, ov: p})
+	}
+	for i := range sealed {
+		cands = append(cands, cand{vn: sealed[i].VolumeNumber, sealed: &sealed[i]})
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].vn > cands[j].vn })
+
+	for _, c := range cands {
+		if c.ov != nil {
+			e, ok := c.ov.omap.Get(name)
+			if !ok {
+				continue
+			}
+			f, err := sh.readOpen(c.ov, e.Loc, name, excl)
 			switch {
 			case err == nil:
-				f, err = sh.checkErased(f, ov.vol.ID, erased)
+				f, err = sh.checkErased(f, c.ov.vol.ID, erased)
 				return f, false, err
 			case errors.Is(err, errNoIntactReplica):
 				return nil, false, err
@@ -397,9 +510,7 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 			sh.unreadable()
 			return nil, true, nil
 		}
-	}
-	for _, v := range sealed {
-		f, unreadable, err := sh.lookupSealed(v, name, excl)
+		f, unreadable, err := sh.lookupSealed(*c.sealed, name, excl)
 		if err != nil {
 			return nil, false, err
 		}
@@ -408,7 +519,7 @@ func (sh *shard) lookupExcluding(ctx context.Context, name string, excl exclusio
 			return nil, true, nil
 		}
 		if f != nil {
-			f, err = sh.checkErased(f, v.ID, erased)
+			f, err = sh.checkErased(f, c.sealed.ID, erased)
 			return f, false, err
 		}
 	}

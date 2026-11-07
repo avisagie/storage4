@@ -27,7 +27,7 @@ Status: seal and seq logic approved 2026-11-05. `volume/` manages **one replica 
 
 - Committed length = end of the last record made durable by a successful `Sync`; for a volume with several replicas, the caller passes the **minimum** over replicas.
 - `SealFile`: scan `[0, committed)` (must be valid and end exactly at `committed`, else `ErrShortReplica` and nothing is changed); truncate to `committed`; write the seal record at `committed`; sync once. Any crash leaves either an unsealed volume with the same valid prefix (possibly with the seal written and stale tail bytes behind it, which is not "sealed" per format-v1 §6 because the file does not end at the seal) or a sealed one. Running `SealFile` again always finishes.
-- Already sealed at `committed`: no-op returning the existing seal. Sealed at another length: `ErrSealMismatch`.
+- Already sealed at `committed`: no-op returning the existing seal, after an fsync (the seal may come from an attempt whose fsync failed, so it is made durable before success is reported). Sealed at another length: `ErrSealMismatch`.
 - The scan after a seal ignores everything after the first seal record.
 
 ## Reads

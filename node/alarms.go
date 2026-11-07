@@ -15,6 +15,7 @@ const (
 	AlarmDiskExcluded         AlarmID = "disk-excluded"
 	AlarmShardLeaseLost       AlarmID = "shard-lease-lost"
 	AlarmIndexRebuilt         AlarmID = "index-rebuilt"
+	AlarmSealPending          AlarmID = "seal-pending"
 	AlarmMemoryBudget         AlarmID = "memory-budget-exhausted"
 )
 

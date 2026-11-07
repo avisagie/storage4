@@ -54,6 +54,8 @@ type openVolume struct {
 	stop   chan struct{}
 	done   chan struct{}
 
+	final int64 // committed length to seal at, fixed once the committer stopped
+
 	lastWrite atomic.Int64 // Unix nanoseconds on the injected clock
 	fsyncs    *counters
 	now       func() time.Time

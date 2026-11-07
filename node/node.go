@@ -336,6 +336,7 @@ func (n *Node) abandonBucket(name string) {
 	for _, sh := range shards {
 		sh.mu.Lock()
 		sh.abandonLocked()
+		sh.pending = nil // the bucket is deleted: GC removes the files
 		sh.mu.Unlock()
 	}
 }
@@ -443,12 +444,13 @@ func (m nodeMetrics) Snapshot() Snapshot {
 		handles += d.store.OpenHandles()
 	}
 	n.mu.Lock()
-	leases := 0
+	leases, pending := 0, 0
 	for _, sh := range n.shards {
 		sh.mu.Lock()
 		if sh.leased {
 			leases++
 		}
+		pending += len(sh.pending)
 		sh.mu.Unlock()
 	}
 	n.mu.Unlock()
@@ -460,6 +462,7 @@ func (m nodeMetrics) Snapshot() Snapshot {
 			"buffer_budget": n.cfg.MemoryBudget,
 			"index_handles": int64(handles),
 			"leases_held":   int64(leases),
+			"pending_seals": int64(pending),
 			"disks_usable":  int64(len(n.placement())),
 		},
 	}
@@ -489,12 +492,13 @@ func (n *Node) tick(ctx context.Context) {
 	n.mu.Unlock()
 	for _, sh := range shards {
 		sh.mu.Lock()
+		sh.retryPendingLocked(ctx)
 		if sh.leased {
 			if ov := sh.open; ov != nil && now.Sub(time.Unix(0, ov.lastWrite.Load())) >= n.cfg.VolumeIdle {
 				_ = sh.sealOpenLocked(ctx, ov, "idle")
 			}
 			switch {
-			case sh.leased && sh.open == nil:
+			case sh.leased && sh.open == nil && len(sh.pending) == 0:
 				_ = sh.releaseLocked(ctx) // idle shards give their lease back
 			case sh.leased && !now.Before(sh.renewedAt.Add(n.cfg.LeaseTTL/3)):
 				if err := n.d.Catalogue.RenewShard(ctx, sh.lease); err == nil {
@@ -588,6 +592,7 @@ func (n *Node) Stop(ctx context.Context) error {
 	n.mu.Unlock()
 	for _, sh := range shards {
 		sh.mu.Lock()
+		sh.retryPendingLocked(ctx) // best effort: a restart seals what is left
 		if sh.open != nil {
 			// A lost lease or a deleted bucket leaves the volume for the
 			// next lease holder (or GC) to seal; that is not a Stop failure.
@@ -665,11 +670,13 @@ func (n *Node) recoverVolume(ctx context.Context, l catalogue.Lease, v catalogue
 			committed = r.c
 		}
 	}
+	// One seal check for all replicas keeps them byte-identical.
+	chk := n.randUint32()
+	var unsealable []rep
 	for _, r := range good {
-		seal, err := volume.SealFile(r.d.fs, path, committed, epoch, n.randUint32)
+		seal, err := volume.SealFile(r.d.fs, path, committed, epoch, func() uint32 { return chk })
 		if err != nil {
-			_ = n.d.Catalogue.SetReplicaState(ctx, v.ID, r.d.id, catalogue.ReplicaFailed)
-			n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a volume replica could not be sealed")
+			unsealable = append(unsealable, r)
 			continue
 		}
 		sealed++
@@ -685,8 +692,19 @@ func (n *Node) recoverVolume(ctx context.Context, l catalogue.Lease, v catalogue
 			n.cnt.indexRebuilds.Add(1)
 		}
 	}
+	if sealed == 0 && len(good) > 0 {
+		// The replicas are readable but none could be sealed (e.g. IO errors
+		// on the seal write): the data may be intact, so do not record the
+		// volume as empty. It stays unsealed and the next recovery retries.
+		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "no replica of a volume could be sealed")
+		return fmt.Errorf("recover volume: %w", errNoReplicaSealed)
+	}
+	for _, r := range unsealable {
+		_ = n.d.Catalogue.SetReplicaState(ctx, v.ID, r.d.id, catalogue.ReplicaFailed)
+		n.d.Alarms.Raise(AlarmReplicaUnavailable, Critical, "a volume replica could not be sealed")
+	}
 	if sealed == 0 {
-		committed, records = 0, 0
+		committed, records = 0, 0 // no replica is readable: the data is gone
 	}
 	if err := n.d.Catalogue.FinishSeal(ctx, l, v.ID, epoch, committed, records); err != nil {
 		return err
